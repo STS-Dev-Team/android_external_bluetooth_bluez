@@ -4,6 +4,7 @@
  *
  *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2009-2010  Motorola Corporation
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -45,6 +46,13 @@
 #include <bluetooth/hidp.h>
 
 #include "sdp.h"
+
+#ifdef ANDROID_BLUETOOTHDUN
+#include <glib.h>
+#include <dbus/dbus.h>
+#include <gdbus.h>
+#endif
+
 #include "dund.h"
 #include "lib.h"
 
@@ -77,10 +85,10 @@ static uint use_cache;
 static int  channel;
 
 static struct {
-	uint     valid;
-	char     dst[40];
+	uint	 valid;
+	char	 dst[40];
 	bdaddr_t bdaddr;
-	int      channel;
+	int	 channel;
 } cache;
 
 static bdaddr_t src_addr = *BDADDR_ANY;
@@ -95,6 +103,10 @@ enum {
 	CONNECT,
 	KILL
 } modes;
+
+#ifdef ANDROID_BLUETOOTHDUN
+static GMainLoop *event_loop = NULL;
+#endif
 
 static int create_connection(char *dst, bdaddr_t *bdaddr, int mrouter);
 
@@ -157,7 +169,13 @@ static int do_listen(void)
 	}
 
 	listen(sk, 10);
-
+#ifdef ANDROID_BLUETOOTHDUN
+	if (type == DIALUP) {
+		syslog(LOG_INFO, "do_listen with dbus g_watch...");
+		dun_add_watch(sk);
+		return 0;
+	}
+#endif
 	while (!terminate) {
 		socklen_t alen = sizeof(sa);
 		int nsk;
@@ -238,7 +256,7 @@ static int create_connection(char *dst, bdaddr_t *bdaddr, int mrouter)
 	sk = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
 	if (sk < 0) {
 		syslog(LOG_ERR, "Cannot create RFCOMM socket. %s(%d)",
-		     strerror(errno), errno);
+			strerror(errno), errno);
 		return -1;
 	}
 
@@ -374,6 +392,9 @@ static void sig_term(int sig)
 {
 	io_cancel();
 	terminate = 1;
+#ifdef ANDROID_BLUETOOTHDUN
+	g_main_loop_quit(event_loop);
+#endif
 }
 
 static struct option main_lopts[] = {
@@ -438,6 +459,13 @@ int main(int argc, char *argv[])
 	struct sigaction sa;
 	int mode = NONE;
 	int opt;
+
+#ifdef ANDROID_SET_AID_AND_CAP
+	/* Unfortunately Android's init.rc does not yet support applying
+	* capabilities. So we must do it in-process. */
+	void *android_set_aid_and_cap(void);
+	android_set_aid_and_cap();
+#endif
 
 	while ((opt=getopt_long(argc, argv, main_sopts, main_lopts, NULL)) != -1) {
 		switch(opt) {
@@ -630,6 +658,14 @@ int main(int argc, char *argv[])
 		use_cache = cache.valid = ~0;
 	}
 
+#ifdef ANDROID_BLUETOOTHDUN
+	if (dun_dbus_init() < 0)
+	{
+		perror("Unable to get on D-Bus");
+		exit(1);
+	}
+	event_loop = g_main_loop_new(NULL, FALSE);
+#endif
 	switch (mode) {
 	case CONNECT:
 		do_connect();
@@ -640,6 +676,20 @@ int main(int argc, char *argv[])
 		break;
 	}
 
+#ifdef ANDROID_BLUETOOTHDUN
+	g_main_loop_run(event_loop);
+
+	syslog(LOG_INFO, "g_main_loop_quited, dun daemon exiting...");
+	if (type == DIALUP) {
+		dun_remove_watch();
+		if (use_sdp) {
+			dun_sdp_unregister();
+		}
+	}
+
+	dun_dbus_clean();
+	g_main_loop_unref(event_loop);
+#endif
 	free(dst);
 	return 0;
 }

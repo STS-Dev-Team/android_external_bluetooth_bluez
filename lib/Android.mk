@@ -6,6 +6,7 @@ LOCAL_SRC_FILES:= \
 	sdp.c \
 	hci.c \
 	uuid.c \
+	hci_vs.c \
 
 LOCAL_C_INCLUDES:= \
 	$(LOCAL_PATH)/bluetooth \

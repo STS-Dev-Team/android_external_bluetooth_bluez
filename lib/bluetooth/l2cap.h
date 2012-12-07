@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2000-2001  Qualcomm Incorporated
+ *  Copyright (c) 2000-2001, 2010-2011 Code Aurora Forum. All rights reserved.
  *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
  *
@@ -35,6 +35,8 @@ extern "C" {
 /* L2CAP defaults */
 #define L2CAP_DEFAULT_MTU	672
 #define L2CAP_DEFAULT_FLUSH_TO	0xFFFF
+#define L2CAP_DEFAULT_TX_WINDOW	63
+#define L2CAP_DEFAULT_MAX_TX	3
 
 /* L2CAP socket address */
 struct sockaddr_l2 {
@@ -43,6 +45,12 @@ struct sockaddr_l2 {
 	bdaddr_t	l2_bdaddr;
 	unsigned short	l2_cid;
 };
+
+/* L2CAP fixed channel CIDs */
+#define L2CAP_SIGNAL_CHAN_CID		0x0001
+#define L2CAP_CONNECTIONLESS_CID	0x0002
+#define L2CAP_AMP_MGR_CID  		0x0003
+#define L2CAP_AMP_TEST_CID 		0x003F
 
 /* L2CAP socket options */
 #define L2CAP_OPTIONS	0x01
@@ -82,6 +90,16 @@ struct l2cap_conninfo {
 #define L2CAP_ECHO_RSP		0x09
 #define L2CAP_INFO_REQ		0x0a
 #define L2CAP_INFO_RSP		0x0b
+#define L2CAP_CREATE_REQ	0x0c
+#define L2CAP_CREATE_RSP	0x0d
+#define L2CAP_MOVE_REQ		0x0e
+#define L2CAP_MOVE_RSP		0x0f
+#define L2CAP_MOVE_CFM		0x10
+#define L2CAP_MOVE_CFM_RSP	0x11
+
+/* L2CAP checksum option */
+#define L2CAP_FCS_NONE		0x00
+#define L2CAP_FCS_CRC16		0x01
 
 /* L2CAP structures */
 typedef struct {
@@ -160,6 +178,8 @@ typedef struct {
 #define L2CAP_CONF_QOS		0x03
 #define L2CAP_CONF_RFC		0x04
 #define L2CAP_CONF_FCS		0x05
+#define L2CAP_CONF_EFS		0x06
+#define L2CAP_CONF_EWS		0x07
 
 #define L2CAP_CONF_MAX_SIZE	22
 
@@ -192,6 +212,44 @@ typedef struct {
 	uint8_t		data[0];
 } __attribute__ ((packed)) l2cap_info_rsp;
 #define L2CAP_INFO_RSP_SIZE 4
+
+typedef struct {
+	uint16_t	psm;
+	uint16_t	scid;
+	uint8_t		id;
+} __attribute__ ((packed)) l2cap_create_req;
+#define L2CAP_CREATE_REQ_SIZE 5
+
+typedef struct {
+	uint16_t	dcid;
+	uint16_t	scid;
+	uint16_t	result;
+	uint16_t	status;
+} __attribute__ ((packed)) l2cap_create_rsp;
+#define L2CAP_CREATE_RSP_SIZE 8
+
+typedef struct {
+	uint16_t	icid;
+	uint8_t		id;
+} __attribute__ ((packed)) l2cap_move_req;
+#define L2CAP_MOVE_REQ_SIZE 3
+
+typedef struct {
+	uint16_t	icid;
+	uint16_t	result;
+} __attribute__ ((packed)) l2cap_move_rsp;
+#define L2CAP_MOVE_RSP_SIZE 4
+
+typedef struct {
+	uint16_t	icid;
+	uint16_t	result;
+} __attribute__ ((packed)) l2cap_move_cfm;
+#define L2CAP_MOVE_CFM_SIZE 4
+
+typedef struct {
+	uint16_t	icid;
+} __attribute__ ((packed)) l2cap_move_cfm_rsp;
+#define L2CAP_MOVE_CFM_RSP_SIZE 2
 
 /* info type */
 #define L2CAP_IT_CL_MTU		0x0001

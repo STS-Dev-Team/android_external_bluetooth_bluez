@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2000-2001  Qualcomm Incorporated
+ *  Copyright (C) 2000-2001, 2010-2011  Code Aurora Forum.  All rights reserved.
  *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
  *
@@ -22,7 +22,6 @@
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  *
  */
-
 #ifndef __HCI_H
 #define __HCI_H
 
@@ -34,7 +33,7 @@ extern "C" {
 
 #define HCI_MAX_DEV	16
 
-#define HCI_MAX_ACL_SIZE	1024
+#define HCI_MAX_ACL_SIZE	1500
 #define HCI_MAX_SCO_SIZE	255
 #define HCI_MAX_EVENT_SIZE	260
 #define HCI_MAX_FRAME_SIZE	(HCI_MAX_ACL_SIZE + 4)
@@ -92,6 +91,7 @@ enum {
 #define HCIGETCONNLIST	_IOR('H', 212, int)
 #define HCIGETCONNINFO	_IOR('H', 213, int)
 #define HCIGETAUTHINFO	_IOR('H', 215, int)
+#define HCISETAUTHINFO	_IOR('H', 216, int)
 
 #define HCISETRAW	_IOW('H', 220, int)
 #define HCISETSCAN	_IOW('H', 221, int)
@@ -603,6 +603,13 @@ typedef struct {
 #define LOGICAL_LINK_CANCEL_RP_SIZE 3
 
 #define OCF_FLOW_SPEC_MODIFY		0x003C
+typedef struct {
+	uint16_t	handle;
+	uint8_t		tx_flow[16];
+	uint8_t		rx_flow[16];
+} __attribute__ ((packed)) flow_spec_modify_cp;
+#define FLOW_SPEC_MODIFY_CP_SIZE 34
+
 
 /* Link Policy */
 #define OGF_LINK_POLICY		0x02
@@ -655,9 +662,9 @@ typedef struct {
 } __attribute__ ((packed)) hci_qos;
 #define HCI_QOS_CP_SIZE 17
 typedef struct {
-	uint16_t 	handle;
-	uint8_t 	flags;			/* Reserved */
-	hci_qos 	qos;
+	uint16_t	handle;
+	uint8_t		flags;			/* Reserved */
+	hci_qos		qos;
 } __attribute__ ((packed)) qos_setup_cp;
 #define QOS_SETUP_CP_SIZE (3 + HCI_QOS_CP_SIZE)
 
@@ -686,7 +693,7 @@ typedef struct {
 } __attribute__ ((packed)) read_link_policy_cp;
 #define READ_LINK_POLICY_CP_SIZE 2
 typedef struct {
-	uint8_t 	status;
+	uint8_t		status;
 	uint16_t	handle;
 	uint16_t	policy;
 } __attribute__ ((packed)) read_link_policy_rp;
@@ -699,7 +706,7 @@ typedef struct {
 } __attribute__ ((packed)) write_link_policy_cp;
 #define WRITE_LINK_POLICY_CP_SIZE 4
 typedef struct {
-	uint8_t 	status;
+	uint8_t		status;
 	uint16_t	handle;
 } __attribute__ ((packed)) write_link_policy_rp;
 #define WRITE_LINK_POLICY_RP_SIZE 3
@@ -933,6 +940,11 @@ typedef struct {
 #define OCF_READ_AUTOMATIC_FLUSH_TIMEOUT	0x0027
 
 #define OCF_WRITE_AUTOMATIC_FLUSH_TIMEOUT	0x0028
+typedef struct {
+	uint16_t	handle;
+	uint16_t	timeout;
+} __attribute__ ((packed)) write_flush_timeout_cp;
+#define WRITE_FLUSH_TIMEOUT_CP_SIZE 4
 
 #define OCF_READ_NUM_BROADCAST_RETRANS	0x0029
 
@@ -1250,6 +1262,7 @@ typedef struct {
 	uint16_t	handle;
 	uint32_t	timeout;
 } __attribute__ ((packed)) write_best_effort_flush_timeout_cp;
+
 #define WRITE_BEST_EFFORT_FLUSH_TIMEOUT_CP_SIZE 6
 typedef struct {
 	uint8_t		status;
@@ -1797,14 +1810,14 @@ typedef struct {
 } __attribute__ ((packed)) evt_qos_setup_complete;
 #define EVT_QOS_SETUP_COMPLETE_SIZE (4 + HCI_QOS_CP_SIZE)
 
-#define EVT_CMD_COMPLETE 		0x0E
+#define EVT_CMD_COMPLETE		0x0E
 typedef struct {
 	uint8_t		ncmd;
 	uint16_t	opcode;
 } __attribute__ ((packed)) evt_cmd_complete;
 #define EVT_CMD_COMPLETE_SIZE 3
 
-#define EVT_CMD_STATUS 			0x0F
+#define EVT_CMD_STATUS			0x0F
 typedef struct {
 	uint8_t		status;
 	uint8_t		ncmd;
@@ -2223,32 +2236,32 @@ typedef struct {
 } __attribute__ ((packed)) evt_si_device;
 #define EVT_SI_DEVICE_SIZE 4
 
-/* --------  HCI Packet structures  -------- */
+/* --------	 HCI Packet structures	-------- */
 #define HCI_TYPE_LEN	1
 
 typedef struct {
 	uint16_t	opcode;		/* OCF & OGF */
 	uint8_t		plen;
 } __attribute__ ((packed))	hci_command_hdr;
-#define HCI_COMMAND_HDR_SIZE 	3
+#define HCI_COMMAND_HDR_SIZE	3
 
 typedef struct {
 	uint8_t		evt;
 	uint8_t		plen;
 } __attribute__ ((packed))	hci_event_hdr;
-#define HCI_EVENT_HDR_SIZE 	2
+#define HCI_EVENT_HDR_SIZE	2
 
 typedef struct {
 	uint16_t	handle;		/* Handle & Flags(PB, BC) */
 	uint16_t	dlen;
 } __attribute__ ((packed))	hci_acl_hdr;
-#define HCI_ACL_HDR_SIZE 	4
+#define HCI_ACL_HDR_SIZE	4
 
 typedef struct {
 	uint16_t	handle;
 	uint8_t		dlen;
 } __attribute__ ((packed))	hci_sco_hdr;
-#define HCI_SCO_HDR_SIZE 	3
+#define HCI_SCO_HDR_SIZE	3
 
 typedef struct {
 	uint16_t	device;
@@ -2315,14 +2328,14 @@ struct hci_dev_stats {
 
 struct hci_dev_info {
 	uint16_t dev_id;
-	char     name[8];
+	char	 name[8];
 
 	bdaddr_t bdaddr;
 
 	uint32_t flags;
-	uint8_t  type;
+	uint8_t	 type;
 
-	uint8_t  features[8];
+	uint8_t	 features[8];
 
 	uint32_t pkt_type;
 	uint32_t link_policy;
@@ -2333,19 +2346,21 @@ struct hci_dev_info {
 	uint16_t sco_mtu;
 	uint16_t sco_pkts;
 
-	struct   hci_dev_stats stat;
+	struct	 hci_dev_stats stat;
 };
 
 struct hci_conn_info {
 	uint16_t handle;
 	bdaddr_t bdaddr;
-	uint8_t  type;
+	uint8_t	 type;
 	uint8_t	 out;
 	uint16_t state;
 	uint32_t link_mode;
 	uint32_t mtu;
 	uint32_t cnt;
 	uint32_t pkts;
+	uint8_t pending_sec_level;
+	uint8_t ssp_mode;
 };
 
 struct hci_dev_req {
@@ -2366,21 +2381,21 @@ struct hci_conn_list_req {
 
 struct hci_conn_info_req {
 	bdaddr_t bdaddr;
-	uint8_t  type;
+	uint8_t	 type;
 	struct hci_conn_info conn_info[0];
 };
 
 struct hci_auth_info_req {
 	bdaddr_t bdaddr;
-	uint8_t  type;
+	uint8_t	 type;
 };
 
 struct hci_inquiry_req {
 	uint16_t dev_id;
 	uint16_t flags;
-	uint8_t  lap[3];
-	uint8_t  length;
-	uint8_t  num_rsp;
+	uint8_t	 lap[3];
+	uint8_t	 length;
+	uint8_t	 num_rsp;
 };
 #define IREQ_CACHE_FLUSH 0x0001
 

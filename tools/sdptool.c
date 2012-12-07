@@ -7,7 +7,7 @@
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
  *  Copyright (C) 2002-2003  Stephen Crane <steve.crane@rococosoft.com>
  *  Copyright (C) 2002-2003  Jean Tourrilhes <jt@hpl.hp.com>
- *
+ *  Copyright (c) 2010, Code Aurora Forum.  All Rights Reserved.
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -788,6 +788,31 @@ static int set_attrib(sdp_session_t *sess, uint32_t handle, uint16_t attrib, cha
 			attrib, value_int, handle);
 
 		sdp_attr_add_new(rec, attrib, SDP_UINT32, &value_int);
+	} else if (!strncasecmp(value, "16:0x", 5)) {
+		/* Int 16 bit */
+		uint16_t value_int;
+		value_int = strtoul(value + 5, NULL, 16);
+		printf("Adding attrib 0x%X int16 0x%X to record 0x%X\n",
+			attrib, value_int, handle);
+
+		sdp_attr_add_new(rec, attrib, SDP_UINT16, &value_int);
+	} else if (!strncasecmp(value, "8:0x", 4)) {
+		/* Int 8 bit */
+		uint8_t value_int;
+		value_int = strtoul(value + 4, NULL, 16);
+		printf("Adding attrib 0x%X int8 0x%X to record 0x%X\n",
+			attrib, value_int, handle);
+
+		sdp_attr_add_new(rec, attrib, SDP_UINT8, &value_int);
+	} else if (!strncasecmp(value, "url:", 4)) {
+		/* Strip off the "url:" indicator */
+		char *value_url;
+		value_url = value + 4;
+		/* URL type String */
+		printf("Adding attrib 0x%X url string \"%s\" to record 0x%X\n",
+			attrib, value_url, handle);
+		/* Add/Update our attributes to the record */
+		sdp_attr_add_new(rec, attrib, SDP_URL_STR8, value_url);
 	} else {
 		/* String */
 		printf("Adding attrib 0x%X string \"%s\" to record 0x%X\n",
@@ -870,6 +895,8 @@ static int set_attribseq(sdp_session_t *session, uint32_t handle, uint16_t attri
 	void **allocArray;
 	uint8_t uuid16 = SDP_UUID16;
 	uint8_t uint32 = SDP_UINT32;
+	uint8_t uint16 = SDP_UINT16;
+	uint8_t uint8 = SDP_UINT8;
 	uint8_t str8 = SDP_TEXT_STR8;
 	int i, ret = 0;
 
@@ -909,6 +936,26 @@ static int set_attribseq(sdp_session_t *session, uint32_t handle, uint16_t attri
 
 			printf("Adding int 0x%X to record 0x%X\n", *value_int, handle);
 			dtdArray[i] = &uint32;
+			valueArray[i] = value_int;
+		} else if (!strncasecmp(argv[i], "16:0x", 5)) {
+			/* Int 16 bit */
+			uint32_t *value_int = (uint32_t *) malloc(sizeof(int));
+			allocArray[i] = value_int;
+			*value_int = strtoul((argv[i]) + 5, NULL, 16);
+
+			printf("Adding int16 0x%X to record 0x%X\n", *value_int, handle);
+			dtdArray[i] = &uint16;
+			valueArray[i] = value_int;
+		} else if (!strncasecmp(argv[i], "8:0x", 4)) {
+			/* Int 8 bit*/
+			uint32_t *value_int = (uint32_t *) malloc(sizeof(int));
+			allocArray[i] = value_int;
+			*value_int = strtoul((argv[i]) + 4, NULL, 16);
+
+			printf("Adding int8 0x%X to record 0x%X\n", *value_int,
+				handle);
+
+			dtdArray[i] = &uint8;
 			valueArray[i] = value_int;
 		} else {
 			/* String */
@@ -1008,6 +1055,11 @@ static void print_service_class(void *value, void *userData)
 		printf("  \"%s\" (0x%s)\n", ServiceClassUUID_str, UUID_str);
 	else
 		printf("  UUID 128: %s\n", UUID_str);
+
+	/* Determine if this is an GOEP 2.0 capable profile. */
+	if (userData && sdp_uuid_to_proto(uuid) == OBEX_OBJPUSH_PROFILE_ID) {
+		*((int*)userData) = 1;
+	}
 }
 
 static void print_service_desc(void *value, void *user)
@@ -1098,6 +1150,7 @@ static void print_profile_desc(void *value, void *userData)
 static void print_service_attr(sdp_record_t *rec)
 {
 	sdp_list_t *list = 0, *proto = 0;
+	int is_goep2_srv = 0;
 
 	sdp_record_print(rec);
 
@@ -1105,7 +1158,7 @@ static void print_service_attr(sdp_record_t *rec)
 
 	if (sdp_get_service_classes(rec, &list) == 0) {
 		printf("Service Class ID List:\n");
-		sdp_list_foreach(list, print_service_class, 0);
+		sdp_list_foreach(list, print_service_class, &is_goep2_srv);
 		sdp_list_free(list, free);
 	}
 	if (sdp_get_access_protos(rec, &proto) == 0) {
@@ -1123,6 +1176,12 @@ static void print_service_attr(sdp_record_t *rec)
 		printf("Profile Descriptor List:\n");
 		sdp_list_foreach(list, print_profile_desc, 0);
 		sdp_list_free(list, free);
+	}
+
+	if (is_goep2_srv) {
+		sdp_data_t *d = sdp_data_get(rec, SDP_ATTR_GOEP_L2CAP_PSM);
+	if (d)
+		printf("GOEP L2CAP PSM: %d\n", d->val.uint16);
 	}
 }
 
@@ -1496,7 +1555,11 @@ static int add_headset_ag(sdp_session_t *session, svc_info_t *si)
 	sdp_set_service_classes(&record, svclass_id);
 
 	sdp_uuid16_create(&profile.uuid, HEADSET_PROFILE_ID);
+#ifdef ANDROID
+	profile.version = 0x0102;
+#else
 	profile.version = 0x0100;
+#endif
 	pfseq = sdp_list_append(0, &profile);
 	sdp_set_profile_descs(&record, pfseq);
 
@@ -1700,7 +1763,7 @@ static int add_simaccess(sdp_session_t *session, svc_info_t *si)
 	sdp_set_service_classes(&record, svclass_id);
 
 	sdp_uuid16_create(&profile.uuid, SAP_PROFILE_ID);
-	profile.version = 0x0101;
+	profile.version = 0x0102;
 	pfseq = sdp_list_append(0, &profile);
 	sdp_set_profile_descs(&record, pfseq);
 
@@ -1748,6 +1811,7 @@ static int add_opush(sdp_session_t *session, svc_info_t *si)
 	sdp_list_t *aproto, *proto[3];
 	sdp_record_t record;
 	uint8_t chan = si->channel ? si->channel : 9;
+	uint16_t psm = si->psm;
 	sdp_data_t *channel;
 #ifdef ANDROID
 	uint8_t formats[] = { 0x01, 0x02, 0xff };
@@ -1758,6 +1822,7 @@ static int add_opush(sdp_session_t *session, svc_info_t *si)
 	unsigned int i;
 	uint8_t dtd = SDP_UINT8;
 	sdp_data_t *sflist;
+	sdp_data_t *goeppsm = NULL;
 	int ret = 0;
 
 	memset(&record, 0, sizeof(sdp_record_t));
@@ -1771,8 +1836,12 @@ static int add_opush(sdp_session_t *session, svc_info_t *si)
 	svclass_id = sdp_list_append(0, &opush_uuid);
 	sdp_set_service_classes(&record, svclass_id);
 
+	/*
+	 * Implicitly set OPP profile version to 1.2 when adding a record
+	 * containing a PSM (for OBEX-over-L2CAP)
+	 */
 	sdp_uuid16_create(&profile[0].uuid, OBEX_OBJPUSH_PROFILE_ID);
-	profile[0].version = 0x0100;
+	profile[0].version = psm ? 0x0102 : 0x0100;
 	pfseq = sdp_list_append(0, profile);
 	sdp_set_profile_descs(&record, pfseq);
 
@@ -1800,6 +1869,13 @@ static int add_opush(sdp_session_t *session, svc_info_t *si)
 	sflist = sdp_seq_alloc(dtds, values, sizeof(formats));
 	sdp_attr_add(&record, SDP_ATTR_SUPPORTED_FORMATS_LIST, sflist);
 
+	if (psm) {
+		goeppsm = sdp_data_alloc(SDP_UINT16, &psm);
+		if (goeppsm) {
+			sdp_attr_add(&record, SDP_ATTR_GOEP_L2CAP_PSM, goeppsm);
+		}
+	}
+
 	sdp_set_info_attr(&record, "OBEX Object Push", 0, 0);
 
 	if (sdp_device_record_register(session, &interface, &record, SDP_RECORD_PERSIST) < 0) {
@@ -1811,6 +1887,10 @@ static int add_opush(sdp_session_t *session, svc_info_t *si)
 	printf("OBEX Object Push service registered\n");
 
 end:
+	if (psm && goeppsm) {
+		sdp_data_free(goeppsm);
+	}
+	sdp_data_free(sflist);
 	sdp_data_free(channel);
 	sdp_list_free(proto[0], 0);
 	sdp_list_free(proto[1], 0);
@@ -1900,9 +1980,11 @@ static int add_ftp(sdp_session_t *session, svc_info_t *si)
 	sdp_profile_desc_t profile[1];
 	sdp_list_t *aproto, *proto[3];
 	sdp_record_t record;
+	uint16_t psm = si->psm;
 	uint8_t u8 = si->channel ? si->channel: 10;
 	sdp_data_t *channel;
 	int ret = 0;
+        sdp_data_t *goeppsm = NULL;
 
 	memset(&record, 0, sizeof(sdp_record_t));
 	record.handle = si->handle;
@@ -1915,8 +1997,13 @@ static int add_ftp(sdp_session_t *session, svc_info_t *si)
 	svclass_id = sdp_list_append(0, &ftrn_uuid);
 	sdp_set_service_classes(&record, svclass_id);
 
+	/*
+	 * Implicitly set FTP profile version to 1.2 when adding a record
+         * containing a PSM (for OBEX-over-L2CAP)
+	 */
+
 	sdp_uuid16_create(&profile[0].uuid, OBEX_FILETRANS_PROFILE_ID);
-	profile[0].version = 0x0100;
+	profile[0].version = psm ? 0x0102 : 0x0100;
 	pfseq = sdp_list_append(0, &profile[0]);
 	sdp_set_profile_descs(&record, pfseq);
 
@@ -1937,6 +2024,13 @@ static int add_ftp(sdp_session_t *session, svc_info_t *si)
 	aproto = sdp_list_append(0, apseq);
 	sdp_set_access_protos(&record, aproto);
 
+	if (psm) {
+		goeppsm = sdp_data_alloc(SDP_UINT16, &psm);
+		if (goeppsm) {
+			sdp_attr_add(&record, SDP_ATTR_GOEP_L2CAP_PSM, goeppsm);
+		}
+	}
+
 	sdp_set_info_attr(&record, "OBEX File Transfer", 0, 0);
 
 	if (sdp_device_record_register(session, &interface, &record, SDP_RECORD_PERSIST) < 0) {
@@ -1948,6 +2042,9 @@ static int add_ftp(sdp_session_t *session, svc_info_t *si)
 	printf("OBEX File Transfer service registered\n");
 
 end:
+	if (psm && goeppsm) {
+		sdp_data_free(goeppsm);
+	}
 	sdp_data_free(channel);
 	sdp_list_free(proto[0], 0);
 	sdp_list_free(proto[1], 0);
@@ -1956,6 +2053,87 @@ end:
 	sdp_list_free(aproto, 0);
 
 	return ret;
+}
+
+static int add_mas(sdp_session_t *session, svc_info_t *si, uint16_t masid, uint8_t sprtd_msg)
+{
+	sdp_list_t *svclass_id, *pfseq, *apseq, *root;
+	uuid_t root_uuid, ftrn_uuid, l2cap_uuid, rfcomm_uuid, obex_uuid;
+	sdp_profile_desc_t profile[1];
+	sdp_list_t *aproto, *proto[3];
+	sdp_record_t record;
+	uint8_t u8 = si->channel ? si->channel : 10;
+	sdp_data_t *channel;
+	int ret = 0;
+
+	memset(&record, 0, sizeof(sdp_record_t));
+	record.handle = si->handle;
+
+	sdp_uuid16_create(&root_uuid, PUBLIC_BROWSE_GROUP);
+	root = sdp_list_append(0, &root_uuid);
+	sdp_set_browse_groups(&record, root);
+
+	sdp_uuid16_create(&ftrn_uuid, OBEX_MAS_SVCLASS_ID);
+	svclass_id = sdp_list_append(0, &ftrn_uuid);
+	sdp_set_service_classes(&record, svclass_id);
+
+	sdp_uuid16_create(&l2cap_uuid, L2CAP_UUID);
+	proto[0] = sdp_list_append(0, &l2cap_uuid);
+	apseq = sdp_list_append(0, proto[0]);
+
+	sdp_uuid16_create(&rfcomm_uuid, RFCOMM_UUID);
+	proto[1] = sdp_list_append(0, &rfcomm_uuid);
+	channel = sdp_data_alloc(SDP_UINT8, &u8);
+	proto[1] = sdp_list_append(proto[1], channel);
+	apseq = sdp_list_append(apseq, proto[1]);
+
+	sdp_uuid16_create(&obex_uuid, OBEX_UUID);
+	proto[2] = sdp_list_append(0, &obex_uuid);
+	apseq = sdp_list_append(apseq, proto[2]);
+
+	aproto = sdp_list_append(0, apseq);
+	sdp_set_access_protos(&record, aproto);
+
+	sdp_uuid16_create(&profile[0].uuid, OBEX_MAP_PROFILE_ID);
+	profile[0].version = 0x0100;
+	pfseq = sdp_list_append(0, &profile[0]);
+	sdp_set_profile_descs(&record, pfseq);
+
+	sdp_attr_add_new(&record, SDP_ATTR_MAS_INSTANCE_ID, SDP_UINT8,
+							&masid);
+
+	sdp_attr_add_new(&record, SDP_ATTR_SUPPORTED_MESSAGE_TYPES, SDP_UINT8,
+							&sprtd_msg);
+
+	sdp_set_info_attr(&record, "OBEX Message Access", 0, 0);
+
+	if (sdp_device_record_register(session, &interface, &record, SDP_RECORD_PERSIST) < 0) {
+		printf("Service Record registration failed\n");
+		ret = -1;
+		goto end;
+	}
+
+	printf("OBEX Message Access service registered\n");
+
+end:
+	sdp_data_free(channel);
+	sdp_list_free(proto[0], 0);
+	sdp_list_free(proto[1], 0);
+	sdp_list_free(proto[2], 0);
+	sdp_list_free(apseq, 0);
+	sdp_list_free(aproto, 0);
+
+	return ret;
+}
+
+static int add_mas1(sdp_session_t *session, svc_info_t *si)
+{
+	return add_mas(session, si, 1, 0x01);
+}
+
+static int add_mas0(sdp_session_t *session, svc_info_t *si)
+{
+	return add_mas(session, si, 0, 0x0E);
 }
 
 static int add_directprint(sdp_session_t *session, svc_info_t *si)
@@ -3513,6 +3691,8 @@ struct {
 	{ "OPUSH",	OBEX_OBJPUSH_SVCLASS_ID,	add_opush	},
 	{ "FTP",	OBEX_FILETRANS_SVCLASS_ID,	add_ftp		},
 	{ "PRINT",	DIRECT_PRINTING_SVCLASS_ID,	add_directprint	},
+	{ "MAS0",	OBEX_MAP_SVCLASS_ID,		add_mas0	},
+	{ "MAS1",	OBEX_MAP_SVCLASS_ID,		add_mas1	},
 
 	{ "HS",		HEADSET_SVCLASS_ID,		add_headset	},
 	{ "HSAG",	HEADSET_AGW_SVCLASS_ID,		add_headset_ag	},
@@ -3601,7 +3781,7 @@ static struct option add_options[] = {
 
 static const char *add_help =
 	"Usage:\n"
-	"\tadd [--handle=RECORD_HANDLE --channel=CHANNEL] service\n";
+	"\tadd [--handle=RECORD_HANDLE --psm=PSM --channel=CHANNEL --network=NETWORK] service\n";
 
 static int cmd_add(int argc, char **argv)
 {

@@ -260,10 +260,8 @@ LOCAL_SHARED_LIBRARIES := \
 	libbluetoothd \
 	libbluetooth \
 	libc \
-	libcutils
-
-LOCAL_STATIC_LIBRARIES := \
-	libglib_static
+	libcutils \
+	libglib
 
 LOCAL_MODULE_PATH := $(TARGET_OUT_OPTIONAL_EXECUTABLES)
 LOCAL_MODULE_TAGS := eng

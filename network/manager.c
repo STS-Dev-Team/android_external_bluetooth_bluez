@@ -44,6 +44,7 @@
 static DBusConnection *connection = NULL;
 
 static gboolean conf_security = TRUE;
+static gboolean conf_master = FALSE;
 
 static void read_config(const char *file)
 {
@@ -64,11 +65,20 @@ static void read_config(const char *file)
 		g_clear_error(&err);
 	}
 
+	conf_master = g_key_file_get_boolean(keyfile, "General",
+			            "Master", &err);
+	if (err) {
+		DBG("network.conf: %s", err->message);
+		g_clear_error(&err);
+	}
+
 done:
 	g_key_file_free(keyfile);
 
 	DBG("Config options: Security=%s",
 				conf_security ? "true" : "false");
+	DBG("Config options: Master=%s",
+				conf_master ? "true" : "false");
 }
 
 static int network_probe(struct btd_device *device, GSList *uuids, uint16_t id)
@@ -80,7 +90,7 @@ static int network_probe(struct btd_device *device, GSList *uuids, uint16_t id)
 	DBG("path %s", path);
 
 	adapter_get_address(adapter, &src);
-	device_get_address(device, &dst);
+	device_get_address(device, &dst, NULL);
 
 	return connection_register(device, path, &src, &dst, id);
 }
@@ -185,7 +195,7 @@ int network_manager_init(DBusConnection *conn)
 	 * field that defines which service the source is connecting to.
 	 */
 
-	if (server_init(conn, conf_security) < 0)
+	if (server_init(conn, conf_security, conf_master) < 0)
 		return -1;
 
 	/* Register network server if it doesn't exist */

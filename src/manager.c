@@ -313,6 +313,10 @@ static gint adapter_cmp(gconstpointer a, gconstpointer b)
 
 	adapter_get_address(adapter, &src);
 
+#ifdef ANDROID
+	// gix--We only have a single Adapter on Android
+	return 0;
+#endif
 	return bacmp(&src, bdaddr);
 }
 

@@ -5,6 +5,7 @@
  *  Copyright (C) 2006-2007  Nokia Corporation
  *  Copyright (C) 2004-2009  Marcel Holtmann <marcel@holtmann.org>
  *  Copyright (C) 2009-2010  Motorola Inc.
+ *  Copyright (C) 2010, Code Aurora Forum. All rights reserved.
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -65,6 +66,8 @@ struct sink {
 	avdtp_session_state_t session_state;
 	avdtp_state_t stream_state;
 	sink_state_t state;
+	gboolean protection_required;
+	gboolean protected;
 	struct pending_request *connect;
 	struct pending_request *disconnect;
 	DBusConnection *conn;
@@ -85,6 +88,7 @@ static char *str_state[] = {
 	"SINK_STATE_CONNECTING",
 	"SINK_STATE_CONNECTED",
 	"SINK_STATE_PLAYING",
+	"SINK_STATE_DISCONNECTING"
 };
 
 static const char *state2str(sink_state_t state)
@@ -98,10 +102,23 @@ static const char *state2str(sink_state_t state)
 		return "connected";
 	case SINK_STATE_PLAYING:
 		return "playing";
+	case SINK_STATE_DISCONNECTING:
+		return "disconnecting";
 	default:
 		error("Invalid sink state %d", state);
 		return NULL;
 	}
+}
+
+static void sink_set_protected(struct audio_device *dev, gboolean protected)
+{
+	struct sink *sink = dev->sink;
+
+	sink->protected = protected;
+	emit_property_changed(dev->conn, dev->path,
+			AUDIO_SINK_INTERFACE, "Protected",
+			DBUS_TYPE_BOOLEAN, &protected);
+
 }
 
 static void sink_set_state(struct audio_device *dev, sink_state_t new_state)
@@ -208,6 +225,8 @@ static void stream_state_changed(struct avdtp_stream *stream,
 		}
 		sink->stream = NULL;
 		sink->cb_id = 0;
+		/*update as there is no streaming device*/
+		update_streaming_device(dev->btd_dev ,FALSE);
 		break;
 	case AVDTP_STATE_OPEN:
 		if (old_state == AVDTP_STATE_CONFIGURED &&
@@ -233,6 +252,8 @@ static void stream_state_changed(struct avdtp_stream *stream,
 						DBUS_TYPE_BOOLEAN, &value);
 		}
 		sink_set_state(dev, SINK_STATE_CONNECTED);
+		/*update as there is no streaming device*/
+		update_streaming_device(dev->btd_dev, FALSE);
 		break;
 	case AVDTP_STATE_STREAMING:
 		value = TRUE;
@@ -242,11 +263,28 @@ static void stream_state_changed(struct avdtp_stream *stream,
 					AUDIO_SINK_INTERFACE, "Playing",
 					DBUS_TYPE_BOOLEAN, &value);
 		sink_set_state(dev, SINK_STATE_PLAYING);
+		/*update the steaming device to adapter*/
+		update_streaming_device(dev->btd_dev, TRUE);
+		break;
+	case AVDTP_STATE_CLOSING:
+		if (old_state == AVDTP_STATE_STREAMING) {
+			value = FALSE;
+			g_dbus_emit_signal(dev->conn, dev->path,
+						AUDIO_SINK_INTERFACE,
+						"Stopped",
+						DBUS_TYPE_INVALID);
+			emit_property_changed(dev->conn, dev->path,
+						AUDIO_SINK_INTERFACE,
+						"Playing",
+						DBUS_TYPE_BOOLEAN, &value);
+		}
+		if (!a2dp_is_reconfig(sink->session))
+			sink_set_state(dev, SINK_STATE_DISCONNECTING);
 		break;
 	case AVDTP_STATE_CONFIGURED:
-	case AVDTP_STATE_CLOSING:
 	case AVDTP_STATE_ABORTING:
 	default:
+		update_streaming_device(dev->btd_dev, FALSE);
 		break;
 	}
 
@@ -308,6 +346,8 @@ static void stream_setup_complete(struct avdtp *session, struct a2dp_sep *sep,
 
 		sink->connect = NULL;
 		pending_request_free(sink->dev, pending);
+
+		sink_set_protected(sink->dev, sink->protected);
 
 		return;
 	}
@@ -389,6 +429,7 @@ static void discovery_complete(struct avdtp *session, GSList *seps, struct avdtp
 
 	id = a2dp_select_capabilities(sink->session, AVDTP_SEP_TYPE_SINK, NULL,
 						select_complete, sink);
+	sink->protected = sink->protection_required;
 	if (id == 0)
 		goto failed;
 
@@ -499,7 +540,6 @@ static DBusMessage *sink_suspend(DBusConnection *conn,
 {
 	struct audio_device *device = data;
 	struct sink *sink = device->sink;
-	struct pending_request *pending;
 	int err;
 
 	if (!sink->session)
@@ -533,7 +573,6 @@ static DBusMessage *sink_resume(DBusConnection *conn,
 {
 	struct audio_device *device = data;
 	struct sink *sink = device->sink;
-	struct pending_request *pending;
 	int err;
 
 	if (!sink->session)
@@ -613,6 +652,10 @@ static DBusMessage *sink_get_properties(DBusConnection *conn,
 	value = (sink->stream_state >= AVDTP_STATE_CONFIGURED);
 	dict_append_entry(&dict, "Connected", DBUS_TYPE_BOOLEAN, &value);
 
+	/* Protected */
+	value = sink->protected;
+	dict_append_entry(&dict, "Protected", DBUS_TYPE_BOOLEAN, &value);
+
 	/* State */
 	state = state2str(sink->state);
 	if (state)
@@ -621,6 +664,25 @@ static DBusMessage *sink_get_properties(DBusConnection *conn,
 	dbus_message_iter_close_container(&iter, &dict);
 
 	return reply;
+}
+
+static DBusMessage *sink_require_protection(DBusConnection *conn,
+						DBusMessage *msg, void *data)
+{
+	struct audio_device *device = data;
+	struct sink *sink = device->sink;
+	gboolean protection_required;
+
+	if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_BOOLEAN, &protection_required, DBUS_TYPE_INVALID))
+		return g_dbus_create_error(msg, ERROR_INTERFACE ".InvalidArguments",
+				"Invalid arguments in method call");
+
+	if (sink->stream_state >= AVDTP_STATE_CONFIGURED)
+		return g_dbus_create_error(msg, ERROR_INTERFACE ".Failed", "%s", strerror(EBUSY));
+
+	sink->protection_required = protection_required;
+
+	return dbus_message_new_method_return(msg);
 }
 
 static GDBusMethodTable sink_methods[] = {
@@ -635,6 +697,7 @@ static GDBusMethodTable sink_methods[] = {
 	{ "IsConnected",	"",	"b",	sink_is_connected,
 						G_DBUS_METHOD_FLAG_DEPRECATED },
 	{ "GetProperties",	"",	"a{sv}",sink_get_properties },
+	{ "RequireProtection",	"b",	"",	sink_require_protection },
 	{ NULL, NULL, NULL, NULL }
 };
 
@@ -708,6 +771,12 @@ struct sink *sink_init(struct audio_device *dev)
 
 	sink->dev = dev;
 
+#ifdef SCMS_T_DEFAULT_ENFORCE
+	sink->protection_required = TRUE;
+#else
+	sink->protection_required = FALSE;
+#endif
+
 	return sink;
 }
 
@@ -716,6 +785,21 @@ gboolean sink_is_active(struct audio_device *dev)
 	struct sink *sink = dev->sink;
 
 	if (sink->session)
+		return TRUE;
+
+	return FALSE;
+}
+
+gboolean sink_is_streaming(struct audio_device *dev)
+{
+	struct sink *sink = dev->sink;
+
+	if (sink == NULL) {
+		DBG("Sink is Null");
+		return FALSE;
+	}
+
+	if (sink_get_state(dev) == AVDTP_STATE_STREAMING)
 		return TRUE;
 
 	return FALSE;

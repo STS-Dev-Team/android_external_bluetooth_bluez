@@ -3,6 +3,7 @@
  *  BlueZ - Bluetooth protocol stack for Linux
  *
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -102,6 +103,8 @@ typedef struct {
 #define BT_CLOSE			6
 #define BT_CONTROL			7
 #define BT_DELAY_REPORT			8
+#define BT_SUSPEND_STREAM		9
+#define BT_RESUME_STREAM		10
 
 #define BT_CAPABILITIES_TRANSPORT_A2DP	0
 #define BT_CAPABILITIES_TRANSPORT_SCO	1
@@ -138,8 +141,42 @@ struct bt_get_capabilities_req {
 #define BT_A2DP_MPEG24_SINK			0x05
 #define BT_A2DP_ATRAC_SOURCE			0x06
 #define BT_A2DP_ATRAC_SINK			0x07
+
+#ifdef ENABLE_CSR_APTX_CODEC
+#define BT_A2DP_BTAPTX_SOURCE                   0x08
+#define BT_A2DP_BTAPTX_SINK                     0x09
+#define BT_A2DP_UNKNOWN_SOURCE                  0x10
+#define BT_A2DP_UNKNOWN_SINK                    0x11
+#else
 #define BT_A2DP_UNKNOWN_SOURCE			0x08
 #define BT_A2DP_UNKNOWN_SINK			0x09
+#endif //ENABLE_CSR_APTX_CODEC
+
+#ifdef ENABLE_CSR_APTX_CODEC
+#define BT_BTAPTX_SAMPLING_FREQ_16000           (1 << 3)
+#define BT_BTAPTX_SAMPLING_FREQ_32000           (1 << 2)
+#define BT_BTAPTX_SAMPLING_FREQ_44100           (1 << 1)
+#define BT_BTAPTX_SAMPLING_FREQ_48000           1
+
+#define BTAPTX_CHANNEL_MODE_STEREO      2
+
+#define BTAPTX_VENDER_ID0               0x4F
+#define BTAPTX_VENDER_ID1               0x0
+#define BTAPTX_VENDER_ID2               0x0
+#define BTAPTX_VENDER_ID3               0x0
+
+#define BTAPTX_CODEC_ID0                0x1
+#define BTAPTX_CODEC_ID1                0x0
+
+
+#define  BT_A2DP_VENDOR_ID0     0x4F
+#define  BT_A2DP_VENDOR_ID1     0x0
+#define  BT_A2DP_VENDOR_ID2     0x0
+#define  BT_A2DP_VENDOR_ID3     0x0
+#define  BT_A2DP_CODEC_ID0              0x1
+#define  BT_A2DP_CODEC_ID1              0x0
+#endif //ENABLE_CSR_APTX_CODEC
+
 
 #define BT_SBC_SAMPLING_FREQ_16000		(1 << 3)
 #define BT_SBC_SAMPLING_FREQ_32000		(1 << 2)
@@ -212,6 +249,20 @@ typedef struct {
 	uint16_t bitrate;
 } __attribute__ ((packed)) mpeg_capabilities_t;
 
+#ifdef ENABLE_CSR_APTX_CODEC
+typedef struct {
+        codec_capabilities_t capability;
+        uint8_t vender_id0;
+        uint8_t vender_id1;
+        uint8_t vender_id2;
+        uint8_t vender_id3;
+        uint8_t codec_id0;
+        uint8_t codec_id1;
+        uint8_t frequency;
+        uint8_t channel_mode;
+} __attribute__ ((packed)) btaptx_capabilities_t;
+#endif //ENABLE_CSR_APTX_CODEC
+
 typedef struct {
 	codec_capabilities_t capability;
 	uint8_t flags;
@@ -223,6 +274,7 @@ struct bt_get_capabilities_rsp {
 	char			source[18];	/* Address of the local Device */
 	char			destination[18];/* Address of the remote Device */
 	char			object[128];	/* DBus object path */
+	uint8_t			isEdrCapable;	/* EDR capable */
 	uint8_t			data[0];	/* First codec_capabilities_t */
 } __attribute__ ((packed));
 
@@ -250,6 +302,7 @@ struct bt_set_configuration_req {
 struct bt_set_configuration_rsp {
 	bt_audio_msg_header_t	h;
 	uint16_t		link_mtu;	/* Max length that transport supports */
+	uint16_t		content_protection;	/* Content protection that transport supports */
 } __attribute__ ((packed));
 
 #define BT_STREAM_ACCESS_READ		0

@@ -4,6 +4,7 @@
  *
  *  Copyright (C) 2006-2010  Nokia Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -52,8 +53,12 @@
 #include "gateway.h"
 #include "unix.h"
 #include "glib-helper.h"
+#include "../src/adapter.h"
+#include "../src/device.h"
+#include "storage.h"
 
 #define check_nul(str) (str[sizeof(str) - 1] == '\0')
+#define RESUME_TIMEOUT 500
 
 typedef enum {
 	TYPE_NONE,
@@ -90,6 +95,7 @@ struct unix_client {
 	int data_fd; /* To be deleted once two phase configuration is fully implemented */
 	unsigned int req_id;
 	unsigned int cb_id;
+	gboolean local_suspend;
 	gboolean (*cancel) (struct audio_device *dev, unsigned int id);
 };
 
@@ -110,6 +116,7 @@ static void client_free(struct unix_client *client)
 	if (client->caps) {
 		g_slist_foreach(client->caps, (GFunc) g_free, NULL);
 		g_slist_free(client->caps);
+		client->caps = NULL;
 	}
 
 	g_free(client->interface);
@@ -221,6 +228,59 @@ static service_type_t select_service(struct audio_device *dev, const char *inter
 	return TYPE_NONE;
 }
 
+static void a2dp_local_resume_complete(struct avdtp *session,
+				struct avdtp_error *err, void *user_data)
+{
+	struct unix_client *client = user_data;
+	struct a2dp_data *a2dp;
+
+	if (!g_slist_find(clients, client)) {
+		DBG("Client disconnected");
+		return;
+	}
+
+	if (!err)
+		return;
+
+	a2dp = &client->d.a2dp;
+	error("resume failed with err %d", err);
+	if (client->cb_id > 0) {
+		avdtp_stream_remove_cb(a2dp->session, a2dp->stream,
+					client->cb_id);
+		client->cb_id = 0;
+	}
+
+	if (a2dp->sep) {
+		a2dp_sep_unlock(a2dp->sep, a2dp->session);
+		a2dp->sep = NULL;
+	}
+
+	avdtp_unref(a2dp->session);
+	a2dp->session = NULL;
+	a2dp->stream = NULL;
+}
+
+static gboolean a2dp_local_resume(void *data)
+{
+	struct unix_client *client = data;
+	struct a2dp_data *a2dp;
+	DBG("a2dp_resume being called");
+
+	if (!g_slist_find(clients, client)) {
+		DBG("Client disconnected");
+		return FALSE;
+	}
+
+	a2dp = &client->d.a2dp;
+	if (!a2dp)
+		return TRUE;
+
+	a2dp_resume(a2dp->session, a2dp->sep,
+				a2dp_local_resume_complete, client);
+
+	return FALSE;
+}
+
 static void stream_state_changed(struct avdtp_stream *stream,
 					avdtp_state_t old_state,
 					avdtp_state_t new_state,
@@ -228,8 +288,15 @@ static void stream_state_changed(struct avdtp_stream *stream,
 					void *user_data)
 {
 	struct unix_client *client = user_data;
-	struct a2dp_data *a2dp = &client->d.a2dp;
+	struct a2dp_data *a2dp;
 
+	if (!g_slist_find(clients, client)) {
+		DBG("Client disconnected");
+		return;
+	}
+
+	a2dp = &client->d.a2dp;
+	DBG("new state and old state are %d, %d", new_state, old_state);
 	switch (new_state) {
 	case AVDTP_STATE_IDLE:
 		if (a2dp->sep) {
@@ -242,6 +309,39 @@ static void stream_state_changed(struct avdtp_stream *stream,
 		}
 		a2dp->stream = NULL;
 		client->cb_id = 0;
+		break;
+	case AVDTP_STATE_OPEN:
+		if ((old_state == AVDTP_STATE_STREAMING) &&
+		    (client->local_suspend == FALSE)) {
+			uint8_t match = 0;
+			char buf[BT_SUGGESTED_BUFFER_SIZE];
+			struct bt_suspend_stream_ind *suspend_ind = (void*) buf;
+
+			suspend_ind->h.type = BT_REQUEST;
+			suspend_ind->h.name = BT_SUSPEND_STREAM;
+			suspend_ind->h.length = sizeof(*suspend_ind);
+			unix_ipc_sendmsg(client, &suspend_ind->h);
+
+			read_special_map_devaddr("remote_suspend", &client->dev->dst, &match);
+			if (match) {
+				DBG("a2dp_resume being called as remote suspend triggered");
+				g_timeout_add(RESUME_TIMEOUT, a2dp_local_resume, client);
+			}
+		}
+
+		break;
+	case AVDTP_STATE_STREAMING:
+		if (old_state == AVDTP_STATE_OPEN) {
+			uint8_t match = 0;
+			char buf[BT_SUGGESTED_BUFFER_SIZE];
+			struct bt_suspend_stream_ind *resume_ind = (void*) buf;
+
+			resume_ind->h.type = BT_REQUEST;
+			resume_ind->h.name = BT_RESUME_STREAM;
+			resume_ind->h.length = sizeof(*resume_ind);
+			unix_ipc_sendmsg(client, &resume_ind->h);
+		}
+
 		break;
 	default:
 		break;
@@ -299,7 +399,6 @@ static void headset_discovery_complete(struct audio_device *dev, void *user_data
 	ba2str(&dev->src, rsp->source);
 	ba2str(&dev->dst, rsp->destination);
 	strncpy(rsp->object, dev->path, sizeof(rsp->object));
-
 	unix_ipc_sendmsg(client, &rsp->h);
 
 	return;
@@ -518,6 +617,25 @@ static void print_sbc(struct sbc_codec_cap *sbc)
 		sbc->min_bitpool, sbc->max_bitpool);
 }
 
+#ifdef ENABLE_CSR_APTX_CODEC
+static void print_btaptx(struct btaptx_codec_cap *btaptx)
+{
+	DBG("Media Codec: BTAPTX"
+		" Channel Modes: %u"
+		" Frequencies: %u"
+		" Vender ID: %u%u%u%u"
+		" Codec ID: %u%u",
+		btaptx->channel_mode,
+		btaptx->frequency,
+		btaptx->vender_id0,
+		btaptx->vender_id1,
+		btaptx->vender_id2,
+		btaptx->vender_id3,
+		btaptx->codec_id0,
+		btaptx->codec_id1 );
+}
+#endif //ENABLE_CSR_APTX_CODEC
+
 static int a2dp_append_codec(struct bt_get_capabilities_rsp *rsp,
 				struct avdtp_service_capability *cap,
 				uint8_t seid,
@@ -584,7 +702,66 @@ static int a2dp_append_codec(struct bt_get_capabilities_rsp *rsp,
 		mpeg->bitrate = mpeg_cap->bitrate;
 
 		print_mpeg12(mpeg_cap);
-	} else {
+	}
+#ifdef ENABLE_CSR_APTX_CODEC
+	else if (codec_cap->media_codec_type == NON_A2DP_CODEC_BTAPTX) {
+		struct btaptx_codec_cap *btaptx_cap = (void *) codec_cap;
+		btaptx_capabilities_t *btaptx = (void *) codec;
+
+		if ((btaptx_cap->vender_id0 == BTAPTX_VENDER_ID0)
+			&& (btaptx_cap->vender_id1 == BTAPTX_VENDER_ID1)
+			&& (btaptx_cap->vender_id2 == BTAPTX_VENDER_ID2)
+			&& (btaptx_cap->vender_id3 == BTAPTX_VENDER_ID3)
+			&& (btaptx_cap->codec_id0 == BTAPTX_CODEC_ID0)
+			&& (btaptx_cap->codec_id1 == BTAPTX_CODEC_ID1) ) {
+			if (space_left < sizeof(btaptx_capabilities_t))
+				return -ENOMEM;
+			if (type == AVDTP_SEP_TYPE_SINK)
+				codec->type = BT_A2DP_BTAPTX_SINK;
+			else if (type == AVDTP_SEP_TYPE_SOURCE)
+				codec->type = BT_A2DP_BTAPTX_SOURCE;
+			else
+				return -EINVAL;
+
+			codec->length = sizeof(btaptx_capabilities_t);
+
+			btaptx->vender_id0 = btaptx_cap->vender_id0;
+			btaptx->vender_id1 = btaptx_cap->vender_id1;
+			btaptx->vender_id2 = btaptx_cap->vender_id2;
+			btaptx->vender_id3 = btaptx_cap->vender_id3;
+			btaptx->codec_id0 = btaptx_cap->codec_id0;
+			btaptx->codec_id1 = btaptx_cap->codec_id1;
+			btaptx->frequency = btaptx_cap->frequency;
+			btaptx->channel_mode = btaptx_cap->channel_mode;
+
+			print_btaptx(btaptx_cap);
+		} else {
+			size_t codec_length, type_length, total_length;
+
+			codec_length = cap->length - (sizeof(struct avdtp_service_capability)
+					+ sizeof(struct avdtp_media_codec_capability));
+			type_length = sizeof(codec_cap->media_codec_type);
+			total_length = type_length + codec_length +
+			sizeof(codec_capabilities_t);
+
+			if (space_left < total_length)
+				return -ENOMEM;
+
+			if (type == AVDTP_SEP_TYPE_SINK)
+				codec->type = BT_A2DP_UNKNOWN_SINK;
+			else if (type == AVDTP_SEP_TYPE_SOURCE)
+				codec->type = BT_A2DP_UNKNOWN_SOURCE;
+			else
+				return -EINVAL;
+
+			codec->length = total_length;
+			memcpy(codec->data, &codec_cap->media_codec_type, type_length);
+			memcpy(codec->data + type_length, codec_cap->data,
+					codec_length);
+		}
+	}
+#endif
+	else {
 		size_t codec_length, type_length, total_length;
 
 		codec_length = cap->length - (sizeof(struct avdtp_service_capability)
@@ -628,19 +805,20 @@ static void a2dp_discovery_complete(struct avdtp *session, GSList *seps,
 	struct unix_client *client = user_data;
 	char buf[BT_SUGGESTED_BUFFER_SIZE];
 	struct bt_get_capabilities_rsp *rsp = (void *) buf;
-	struct a2dp_data *a2dp = &client->d.a2dp;
+	struct a2dp_data *a2dp;
 
 	if (!g_slist_find(clients, client)) {
 		DBG("Client disconnected during discovery");
 		return;
 	}
 
+	a2dp = &client->d.a2dp;
+	client->req_id = 0;
+
 	if (err)
 		goto failed;
 
 	memset(buf, 0, sizeof(buf));
-	client->req_id = 0;
-
 	rsp->h.type = BT_RESPONSE;
 	rsp->h.name = BT_GET_CAPABILITIES;
 	rsp->h.length = sizeof(*rsp);
@@ -696,6 +874,10 @@ static void a2dp_discovery_complete(struct avdtp *session, GSList *seps,
 		a2dp_append_codec(rsp, cap, seid, type, configured, lock);
 	}
 
+	rsp->isEdrCapable = a2dp_read_edrcapability(&client->dev->src,
+							&client->dev->dst);
+	DBG("EdrCapable, %d", rsp->isEdrCapable);
+
 	unix_ipc_sendmsg(client, &rsp->h);
 
 	return;
@@ -722,10 +904,17 @@ static void a2dp_config_complete(struct avdtp *session, struct a2dp_sep *sep,
 	struct unix_client *client = user_data;
 	char buf[BT_SUGGESTED_BUFFER_SIZE];
 	struct bt_set_configuration_rsp *rsp = (void *) buf;
-	struct a2dp_data *a2dp = &client->d.a2dp;
+	struct a2dp_data *a2dp;
 	uint16_t imtu, omtu;
 	GSList *caps;
+	struct avdtp_service_capability *protection;
 
+	if (!g_slist_find(clients, client)) {
+		DBG("Some old cb. Shouldnt happen as we do cancel in free");
+		return;
+	}
+
+	a2dp = &client->d.a2dp;
 	client->req_id = 0;
 
 	if (err)
@@ -739,7 +928,7 @@ static void a2dp_config_complete(struct avdtp *session, struct a2dp_sep *sep,
 	if (client->cb_id > 0)
 		avdtp_stream_remove_cb(a2dp->session, a2dp->stream,
 								client->cb_id);
-
+	client->cb_id = 0;
 	a2dp->sep = sep;
 	a2dp->stream = stream;
 
@@ -756,6 +945,19 @@ static void a2dp_config_complete(struct avdtp *session, struct a2dp_sep *sep,
 	/* FIXME: Use imtu when fd_opt is CFG_FD_OPT_READ */
 	rsp->link_mtu = omtu;
 
+	protection = avdtp_get_protection(stream);
+
+	/* Initialize to Zero */
+	rsp->content_protection = 0;
+
+	if (protection != NULL) {
+		if (protection->length >= 2) {
+			struct avdtp_content_protection_capability *prot = (void *)protection->data;
+
+			rsp->content_protection = (prot->cp_type_msb << 8) | prot->cp_type_lsb;
+		}
+	}
+
 	unix_ipc_sendmsg(client, &rsp->h);
 
 	client->cb_id = avdtp_stream_add_cb(session, stream,
@@ -768,11 +970,14 @@ failed:
 
 	unix_ipc_error(client, BT_SET_CONFIGURATION, EIO);
 
+	if (a2dp->sep) {
+		a2dp_sep_unlock(a2dp->sep, a2dp->session);
+		a2dp->sep = NULL;
+	}
 	avdtp_unref(a2dp->session);
 
 	a2dp->session = NULL;
 	a2dp->stream = NULL;
-	a2dp->sep = NULL;
 }
 
 static void a2dp_resume_complete(struct avdtp *session,
@@ -782,7 +987,15 @@ static void a2dp_resume_complete(struct avdtp *session,
 	char buf[BT_SUGGESTED_BUFFER_SIZE];
 	struct bt_start_stream_rsp *rsp = (void *) buf;
 	struct bt_new_stream_ind *ind = (void *) buf;
-	struct a2dp_data *a2dp = &client->d.a2dp;
+	struct a2dp_data *a2dp;
+
+	if (!g_slist_find(clients, client)) {
+		DBG("Some old cb. Shouldnt happen as we do cancel in free");
+		return;
+	}
+
+	a2dp = &client->d.a2dp;
+	client->req_id = 0;
 
 	if (err)
 		goto failed;
@@ -819,10 +1032,9 @@ failed:
 		client->cb_id = 0;
 	}
 
-	if (a2dp->sep) {
+	if (a2dp->sep && a2dp_sep_get_lock(a2dp->sep))
 		a2dp_sep_unlock(a2dp->sep, a2dp->session);
-		a2dp->sep = NULL;
-	}
+	a2dp->sep = NULL;
 
 	avdtp_unref(a2dp->session);
 	a2dp->session = NULL;
@@ -835,6 +1047,14 @@ static void a2dp_suspend_complete(struct avdtp *session,
 	struct unix_client *client = user_data;
 	char buf[BT_SUGGESTED_BUFFER_SIZE];
 	struct bt_stop_stream_rsp *rsp = (void *) buf;
+
+	if (!g_slist_find(clients, client)) {
+		DBG("Some old cb. Shouldnt happen as we do cancel in free");
+		return;
+	}
+
+	client->req_id = 0;
+	client->local_suspend = FALSE;
 
 	if (err)
 		goto failed;
@@ -906,6 +1126,11 @@ static void open_complete(struct audio_device *dev, void *user_data)
 	struct unix_client *client = user_data;
 	char buf[BT_SUGGESTED_BUFFER_SIZE];
 	struct bt_open_rsp *rsp = (void *) buf;
+
+	if (!g_slist_find(clients, client)) {
+		DBG("Client disconnected during discovery");
+		return;
+	}
 
 	memset(buf, 0, sizeof(buf));
 
@@ -1063,13 +1288,18 @@ static void start_config(struct audio_device *dev, struct unix_client *client)
 	}
 
 	client->req_id = id;
-	g_slist_free(client->caps);
-	client->caps = NULL;
+	goto cleanup;
 
 	return;
 
 failed:
 	unix_ipc_error(client, BT_SET_CONFIGURATION, EIO);
+cleanup:
+	if (client->caps) {
+		g_slist_foreach(client->caps, (GFunc) g_free, NULL);
+		g_slist_free(client->caps);
+		client->caps = NULL;
+	}
 }
 
 static void start_resume(struct audio_device *dev, struct unix_client *client)
@@ -1182,6 +1412,7 @@ static void start_suspend(struct audio_device *dev, struct unix_client *client)
 		id = a2dp_suspend(a2dp->session, a2dp->sep,
 					a2dp_suspend_complete, client);
 		client->cancel = a2dp_cancel;
+		client->local_suspend = TRUE;
 		break;
 
 	case TYPE_HEADSET:
@@ -1208,7 +1439,7 @@ static void start_suspend(struct audio_device *dev, struct unix_client *client)
 		error("No known services for device");
 		goto failed;
 	}
-
+	client->req_id = id;
 	if (id == 0) {
 		error("suspend failed");
 		goto failed;
@@ -1225,11 +1456,16 @@ failed:
 	unix_ipc_error(client, BT_STOP_STREAM, EIO);
 }
 
-static void close_complete(struct audio_device *dev, void *user_data)
+static gboolean close_complete(void *user_data)
 {
 	struct unix_client *client = user_data;
 	char buf[BT_SUGGESTED_BUFFER_SIZE];
 	struct bt_close_rsp *rsp = (void *) buf;
+
+	if (!g_slist_find(clients, client)) {
+		DBG("Client disconnected");
+		return FALSE;
+	}
 
 	memset(buf, 0, sizeof(buf));
 
@@ -1239,7 +1475,8 @@ static void close_complete(struct audio_device *dev, void *user_data)
 
 	unix_ipc_sendmsg(client, &rsp->h);
 
-	return;
+	// return FALSE in order to make it a one time timeout handler
+	return FALSE;
 }
 
 static void start_close(struct audio_device *dev, struct unix_client *client,
@@ -1289,9 +1526,20 @@ static void start_close(struct audio_device *dev, struct unix_client *client,
 	if (!reply)
 		return;
 
-	close_complete(dev, client);
-	client->dev = NULL;
+	if (client->req_id && client->cancel) {
+		client->cancel(client->dev, client->req_id);
+		client->req_id = 0;
+		/* Cancel initiates abort req, which will not be notified
+		 * over callback. The abort cfm operation will clean SEP
+		 * after which client free is expected for proper opertion.
+		 * This cancel operation is must in failure cases as the
+		 * callback registered with a2dp.c can be called at later
+		 * point of time.*/
+		g_timeout_add(500, close_complete, client);
+	} else
+		close_complete(client);
 
+	client->dev = NULL;
 	return;
 
 failed:
@@ -1485,7 +1733,9 @@ static int handle_a2dp_transport(struct unix_client *client,
 	struct avdtp_service_capability *media_transport, *media_codec;
 	struct sbc_codec_cap sbc_cap;
 	struct mpeg_codec_cap mpeg_cap;
-
+#ifdef ENABLE_CSR_APTX_CODEC
+	struct btaptx_codec_cap btaptx_cap;
+#endif
 	if (!client->interface)
 		/* FIXME: are we treating a sink or a source? */
 		client->interface = g_strdup(AUDIO_SINK_INTERFACE);
@@ -1502,7 +1752,9 @@ static int handle_a2dp_transport(struct unix_client *client,
 	media_transport = avdtp_service_cap_new(AVDTP_MEDIA_TRANSPORT,
 						NULL, 0);
 
-	client->caps = g_slist_append(client->caps, media_transport);
+	if (media_transport != NULL) {
+		client->caps = g_slist_append(client->caps, media_transport);
+	}
 
 	if (req->codec.type == BT_A2DP_MPEG12_SINK ||
 		req->codec.type == BT_A2DP_MPEG12_SOURCE) {
@@ -1543,10 +1795,39 @@ static int handle_a2dp_transport(struct unix_client *client,
 							sizeof(sbc_cap));
 
 		print_sbc(&sbc_cap);
-	} else
+	}
+#ifdef ENABLE_CSR_APTX_CODEC
+	else if (req->codec.type == BT_A2DP_BTAPTX_SINK ||
+			req->codec.type == BT_A2DP_BTAPTX_SOURCE) {
+		btaptx_capabilities_t *btaptx = (void *) &req->codec;
+
+		memset(&btaptx_cap, 0, sizeof(btaptx_cap));
+
+		btaptx_cap.cap.media_type = AVDTP_MEDIA_TYPE_AUDIO;
+		btaptx_cap.cap.media_codec_type = NON_A2DP_CODEC_BTAPTX;
+
+		btaptx_cap.frequency = btaptx->frequency;
+		btaptx_cap.channel_mode = btaptx->channel_mode;
+
+		btaptx_cap.vender_id0 = btaptx->vender_id0;
+		btaptx_cap.vender_id1 = btaptx->vender_id1;
+		btaptx_cap.vender_id2 = btaptx->vender_id2;
+		btaptx_cap.vender_id3 = btaptx->vender_id3;
+		btaptx_cap.codec_id0 = btaptx->codec_id0;
+		btaptx_cap.codec_id1 = btaptx->codec_id1;
+
+		media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, &btaptx_cap,
+		sizeof(btaptx_cap));
+
+		print_btaptx(&btaptx_cap);
+	}
+#endif
+	else
 		return -EINVAL;
 
-	client->caps = g_slist_append(client->caps, media_codec);
+	if (media_codec != NULL) {
+		client->caps = g_slist_append(client->caps, media_codec);
+	}
 
 	return 0;
 }
@@ -1709,6 +1990,11 @@ static gboolean client_cb(GIOChannel *chan, GIOCondition cond, gpointer data)
 		DBG("Unix client disconnected (fd=%d)", client->sock);
 
 		goto failed;
+	}
+
+	if (!g_slist_find(clients, client)) {
+		DBG("Some old cb, can be some client running ");
+		return FALSE;
 	}
 
 	memset(buf, 0, sizeof(buf));

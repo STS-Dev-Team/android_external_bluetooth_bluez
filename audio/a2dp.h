@@ -67,6 +67,37 @@
 #define MAX_BITPOOL 64
 #define MIN_BITPOOL 2
 
+#ifdef ENABLE_CSR_APTX_CODEC
+/*
+ * aptX codec for Bluetooth only supports stereo mode with value 2
+ * But we do have sink devices programmed to send capabilities with other channel mode support.
+ * So to handle the case and keeping codec symmetry with SBC etc., we do define other channel mode,
+ * and we always make sure to set configuration with BTAPTX_CHANNEL_MODE_STEREO only.
+ *
+ * */
+#define NON_A2DP_CODEC_BTAPTX               0xFF
+
+#define BTAPTX_CHANNEL_MODE_MONO		(1 << 3)
+#define BTAPTX_CHANNEL_MODE_DUAL_CHANNEL	(1 << 2)
+#define BTAPTX_CHANNEL_MODE_STEREO		(1 << 1)
+#define BTAPTX_CHANNEL_MODE_JOINT_STEREO	1
+
+#define BTAPTX_VENDER_ID0		0x4F //APTX codec ID 79
+#define BTAPTX_VENDER_ID1		0x0
+#define BTAPTX_VENDER_ID2		0x0
+#define BTAPTX_VENDER_ID3		0x0
+
+#define BTAPTX_CODEC_ID0		0x1
+#define BTAPTX_CODEC_ID1		0x0
+
+#define BTAPTX_SAMPLING_FREQ_16000	(1 << 3)
+#define BTAPTX_SAMPLING_FREQ_32000	(1 << 2)
+#define BTAPTX_SAMPLING_FREQ_44100	(1 << 1)
+#define BTAPTX_SAMPLING_FREQ_48000	1
+
+#endif
+
+
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 
 struct sbc_codec_cap {
@@ -91,6 +122,20 @@ struct mpeg_codec_cap {
 	uint16_t bitrate;
 } __attribute__ ((packed));
 
+#ifdef ENABLE_CSR_APTX_CODEC
+struct btaptx_codec_cap {
+	struct avdtp_media_codec_capability cap;
+	uint8_t vender_id0;
+	uint8_t vender_id1;
+	uint8_t vender_id2;
+	uint8_t vender_id3;
+	uint8_t codec_id0;
+	uint8_t codec_id1;
+	uint8_t frequency:4;
+	uint8_t channel_mode:4;
+} __attribute__ ((packed));
+#endif //ENABLE_CSR_APTX_CODEC
+
 #elif __BYTE_ORDER == __BIG_ENDIAN
 
 struct sbc_codec_cap {
@@ -114,6 +159,21 @@ struct mpeg_codec_cap {
 	uint8_t frequency:6;
 	uint16_t bitrate;
 } __attribute__ ((packed));
+
+#ifdef ENABLE_CSR_APTX_CODEC
+struct btaptx_codec_cap {
+	struct avdtp_media_codec_capability cap;
+	uint8_t vender_id0;
+	uint8_t vender_id1;
+	uint8_t vender_id2;
+	uint8_t vender_id3;
+	uint8_t codec_id0;
+	uint8_t codec_id1;
+	uint8_t frequency:4;
+	uint8_t channel_mode:4;
+} __attribute__ ((packed));
+#endif
+
 
 #else
 #error "Unknown byte order"
@@ -162,3 +222,5 @@ gboolean a2dp_sep_get_lock(struct a2dp_sep *sep);
 struct avdtp_stream *a2dp_sep_get_stream(struct a2dp_sep *sep);
 struct a2dp_sep *a2dp_get_sep(struct avdtp *session,
 				struct avdtp_stream *stream);
+gboolean a2dp_is_reconfig(struct avdtp *session);
+gboolean a2dp_read_edrcapability( bdaddr_t *src, bdaddr_t *dst);

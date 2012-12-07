@@ -342,7 +342,7 @@ guint gatt_discover_char(GAttrib *attrib, uint16_t start, uint16_t end,
 	if (dc == NULL)
 		return 0;
 
-	dc->attrib = g_attrib_ref(attrib);
+	dc->attrib = attrib;
 	dc->cb = func;
 	dc->user_data = user_data;
 	dc->end = end;
@@ -605,7 +605,7 @@ static gboolean parse_proto_params(sdp_list_t *proto_list, uint16_t *psm,
 		*psm = sdp_get_proto_port(proto_list, L2CAP_UUID);
 
 	/* Getting start and end handle */
-	seq1 = proto_seq_find(proto_list);
+	seq1 = sdp_get_proto_desc(proto_list, ATT_UUID);
 	if (!seq1 || seq1->dtd != SDP_UINT16)
 		return FALSE;
 

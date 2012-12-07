@@ -3,6 +3,7 @@
  *  BlueZ - Bluetooth protocol stack for Linux
  *
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -20,6 +21,12 @@
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  *
  */
+#ifdef ANDROID
+#include <utils/Log.h>
+#define LOG_TAG "Bluez"
+#else
+#define LOGE(...) ((void) 0)
+#endif
 
 void info(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void error(const char *format, ...) __attribute__((format(printf, 1, 2)));
@@ -50,7 +57,9 @@ struct btd_debug_desc {
 	__attribute__((used, section("__debug"), aligned(8))) = { \
 		.file = __FILE__, .flags = BTD_DEBUG_FLAG_DEFAULT, \
 	}; \
-	if (__btd_debug_desc.flags & BTD_DEBUG_FLAG_PRINT) \
+	if (__btd_debug_desc.flags & BTD_DEBUG_FLAG_PRINT) {\
 		btd_debug("%s:%s() " fmt,  __FILE__, __FUNCTION__ , ## arg); \
+		LOGE("%s:%s()" fmt, __FILE__, __func__, ##arg); \
+	} \
 } while (0)
 

@@ -41,22 +41,10 @@ plugindir = $(libdir)/bluetooth/plugins
 
 plugin_LTLIBRARIES =
 
-
-lib_headers = lib/bluetooth.h lib/hci.h lib/hci_lib.h lib/mgmt.h \
-		lib/sco.h lib/l2cap.h lib/sdp.h lib/sdp_lib.h lib/uuid.h \
-		lib/rfcomm.h lib/bnep.h lib/cmtp.h lib/hidp.h
-local_headers = $(foreach file,$(lib_headers), lib/bluetooth/$(notdir $(file)))
-
-include_HEADERS += $(lib_headers)
-
 lib_LTLIBRARIES += lib/libbluetooth.la
 
-lib_libbluetooth_la_SOURCES = $(lib_headers) \
-				lib/bluetooth.c lib/hci.c lib/sdp.c lib/uuid.c
+lib_libbluetooth_la_SOURCES = lib/bluetooth.c lib/hci.c lib/sdp.c lib/uuid.c
 lib_libbluetooth_la_LDFLAGS = -version-info 14:1:11
-lib_libbluetooth_la_DEPENDENCIES = $(local_headers)
-
-CLEANFILES += $(local_headers)
 
 
 if SBC
@@ -373,9 +361,9 @@ AM_YFLAGS = -d
 AM_CFLAGS = @DBUS_CFLAGS@ @GLIB_CFLAGS@ @CAPNG_CFLAGS@ \
 		-DBLUETOOTH_PLUGIN_BUILTIN -DPLUGINDIR=\""$(plugindir)"\"
 
-INCLUDES = -I$(builddir)/lib -I$(builddir)/src -I$(srcdir)/src \
-			-I$(srcdir)/audio -I$(srcdir)/sbc -I$(srcdir)/gdbus \
-			-I$(srcdir)/attrib -I$(srcdir)/btio
+INCLUDES = -I$(builddir)/lib -I$(builddir)/lib/bluetooth -I$(builddir)/src \
+			-I$(srcdir)/src -I$(srcdir)/audio -I$(srcdir)/sbc \
+			-I$(srcdir)/gdbus -I$(srcdir)/attrib -I$(srcdir)/btio
 
 if MCAP
 INCLUDES += -I$(builddir)/health
@@ -406,12 +394,3 @@ sap/sap.c: sap/@SAP_DRIVER@
 
 scripts/%.rules:
 	$(AM_V_GEN)cp $(subst 97-,,$@) $@
-
-$(lib_libbluetooth_la_OBJECTS): $(local_headers)
-
-lib/bluetooth/%.h: lib/%.h
-	$(AM_V_at)$(MKDIR_P) lib/bluetooth
-	$(AM_V_GEN)$(LN_S) $(abs_top_srcdir)/$< $@
-
-clean-local:
-	$(RM) -r lib/bluetooth

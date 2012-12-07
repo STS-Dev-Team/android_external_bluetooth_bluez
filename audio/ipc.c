@@ -3,6 +3,7 @@
  *  BlueZ - Bluetooth protocol stack for Linux
  *
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2012, Code Aurora Forum. All rights reserved.
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -40,9 +41,11 @@ static const char *strnames[] = {
 	"BT_NEW_STREAM",
 	"BT_START_STREAM",
 	"BT_STOP_STREAM",
+	"BT_CLOSE",
+	"BT_CONTROL",
+	"BT_DELAY_REPORT",
 	"BT_SUSPEND_STREAM",
 	"BT_RESUME_STREAM",
-	"BT_CONTROL",
 };
 
 int bt_audio_service_open(void)

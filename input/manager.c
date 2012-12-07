@@ -28,6 +28,7 @@
 #include <errno.h>
 
 #include <bluetooth/bluetooth.h>
+#include <bluetooth/uuid.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/sdp.h>
 #include <bluetooth/sdp_lib.h>
@@ -60,24 +61,34 @@ static int hid_device_probe(struct btd_device *device, GSList *uuids)
 {
 	struct btd_adapter *adapter = device_get_adapter(device);
 	const gchar *path = device_get_path(device);
-	const sdp_record_t *rec = btd_device_get_record(device, uuids->data);
+	const sdp_record_t *rec = NULL;
 	bdaddr_t src, dst;
 
 	DBG("path %s", path);
 
-	if (!rec)
-		return -1;
-
 	adapter_get_address(adapter, &src);
-	device_get_address(device, &dst);
+	device_get_address(device, &dst, NULL);
 
-	return input_device_register(connection, device, path, &src, &dst,
-				HID_UUID, rec->handle, idle_timeout * 60);
+	if (device_is_le(device)) {
+		return input_device_register(connection, device, path, &src,
+					&dst, HIDLE_UUID, 1, idle_timeout * 60);
+	} else {
+		rec = btd_device_get_record(device, uuids->data);
+		if (!rec)
+			return -1;
+
+		return input_device_register(connection, device, path, &src,
+						&dst, HID_UUID, rec->handle,
+							idle_timeout * 60);
+	}
 }
 
 static void hid_device_remove(struct btd_device *device)
 {
-	input_remove(device, HID_UUID);
+	if(device_is_le(device))
+		input_remove(device, HIDLE_UUID);
+	else
+		input_remove(device, HID_UUID);
 }
 
 static int headset_probe(struct btd_device *device, GSList *uuids)
@@ -112,7 +123,7 @@ static int headset_probe(struct btd_device *device, GSList *uuids)
 	}
 
 	adapter_get_address(adapter, &src);
-	device_get_address(device, &dst);
+	device_get_address(device, &dst, NULL);
 
 	return fake_input_register(connection, device, path, &src, &dst,
 				HSP_HS_UUID, ch);
@@ -153,7 +164,7 @@ static void hid_server_remove(struct btd_adapter *adapter)
 
 static struct btd_device_driver input_hid_driver = {
 	.name	= "input-hid",
-	.uuids	= BTD_UUIDS(HID_UUID),
+	.uuids	= BTD_UUIDS(HID_UUID, HIDLE_UUID),
 	.probe	= hid_device_probe,
 	.remove	= hid_device_remove,
 };

@@ -34,6 +34,7 @@
 #include <sys/socket.h>
 
 #include <bluetooth/bluetooth.h>
+#include <bluetooth/uuid.h>
 #include <bluetooth/hidp.h>
 #include <bluetooth/sdp.h>
 #include <bluetooth/sdp_lib.h>
@@ -64,6 +65,7 @@
 #define UPDOWN_ENABLED		1
 
 #define FI_FLAG_CONNECTED	1
+#define ATT_CID			4
 
 struct input_conn {
 	struct fake_input	*fake;
@@ -72,8 +74,10 @@ struct input_conn {
 	char			*alias;
 	GIOChannel		*ctrl_io;
 	GIOChannel		*intr_io;
+	GIOChannel		*att_io;
 	guint			ctrl_watch;
 	guint			intr_watch;
+	guint			att_watch;
 	int			timeout;
 	struct input_device	*idev;
 };
@@ -81,16 +85,85 @@ struct input_conn {
 struct input_device {
 	DBusConnection		*conn;
 	char			*path;
+	GAttrib			*attrib;
+	struct att_primary	*att_prim;
 	bdaddr_t		src;
 	bdaddr_t		dst;
 	uint32_t		handle;
 	guint			dc_id;
+	guint8			rep_ref_desc_cnt;
 	char			*name;
 	struct btd_device	*device;
 	GSList			*connections;
+	GSList			*chars;
+	GSList			*rcwatchers;
+};
+
+struct descriptor {
+	struct characteristic	*ch;
+	uint16_t		handle;
+	uint16_t		cli_conf_hndl;
+	uint8_t			report_id;
+	uint8_t			report_type;
+};
+
+struct characteristic {
+	struct input_device *idev;
+	uint16_t handle;
+	uint16_t end;
+	uint8_t perm;
+	char type[MAX_LEN_UUID_STR + 1];
+	struct descriptor desc;
+	uint8_t *value;
+	size_t vlen;
 };
 
 static GSList *devices = NULL;
+
+static int uuid_desc16_cmp(bt_uuid_t *uuid, guint16 desc)
+{
+	bt_uuid_t u16;
+
+	bt_uuid16_create(&u16, desc);
+
+	return bt_uuid_cmp(uuid, &u16);
+}
+
+static void characteristic_free(void *user_data)
+{
+	struct characteristic *chr = user_data;
+
+	if(chr->vlen)
+		g_free(chr->value);
+	g_free(chr);
+}
+
+static void attrib_destroy(gpointer user_data)
+{
+	struct input_device *idev = user_data;
+
+	DBG("attrib destroy");
+
+	g_slist_foreach(idev->chars, (GFunc)characteristic_free, NULL);
+	g_slist_free(idev->chars);
+
+	idev->attrib = NULL;
+}
+
+static void attrib_disconnect(gpointer user_data)
+{
+	struct input_device *idev = user_data;
+
+	DBG("attrib disconnect");
+
+	if (!idev)
+		return;
+
+	g_attrib_set_disconnect_function(idev->attrib, NULL, NULL);
+
+	/* Remote initiated disconnection only */
+	g_attrib_unref(idev->attrib);
+}
 
 static struct input_device *find_device_by_path(GSList *list, const char *path)
 {
@@ -130,11 +203,17 @@ static void input_conn_free(struct input_conn *iconn)
 	if (iconn->intr_watch)
 		g_source_remove(iconn->intr_watch);
 
+	if (iconn->att_watch)
+		g_source_remove(iconn->att_watch);
+
 	if (iconn->intr_io)
 		g_io_channel_unref(iconn->intr_io);
 
 	if (iconn->ctrl_io)
 		g_io_channel_unref(iconn->ctrl_io);
+
+	if (iconn->att_io)
+		g_io_channel_unref(iconn->att_io);
 
 	g_free(iconn->uuid);
 	g_free(iconn->alias);
@@ -431,6 +510,32 @@ static gboolean ctrl_watch_cb(GIOChannel *chan, GIOCondition cond, gpointer data
 	return FALSE;
 }
 
+static gboolean att_watch_cb(GIOChannel *chan, GIOCondition cond, gpointer data)
+{
+	struct input_conn *iconn = data;
+	struct input_device *idev = iconn->idev;
+	gboolean connected = FALSE;
+
+	/* Checking for att_watch avoids a double g_io_channel_shutdown since
+	* it's likely that att_watch_cb has been queued for dispatching in
+	* this mainloop iteration */
+	if ((cond & (G_IO_HUP | G_IO_ERR)) && iconn->att_watch)
+		g_io_channel_shutdown(chan, TRUE, NULL);
+
+	emit_property_changed(idev->conn, idev->path, INPUT_DEVICE_INTERFACE,
+		"Connected", DBUS_TYPE_BOOLEAN, &connected);
+
+	device_remove_disconnect_watch(idev->device, idev->dc_id);
+	idev->dc_id = 0;
+
+	iconn->att_watch = 0;
+
+	g_io_channel_unref(iconn->att_io);
+	iconn->att_io = NULL;
+
+	return FALSE;
+}
+
 static gboolean fake_hid_connect(struct input_conn *iconn, GError **err)
 {
 	struct fake_hid *fhid = iconn->fake->priv;
@@ -569,6 +674,410 @@ cleanup:
 	g_free(req);
 }
 
+static int characteristic_set_value(struct characteristic *chr,
+					const uint8_t *value, size_t vlen)
+{
+	DBG("char set value len %d", vlen);
+
+	chr->value = g_try_realloc(chr->value, vlen);
+	if (chr->value == NULL)
+		return -ENOMEM;
+
+	memcpy(chr->value, value, vlen);
+	chr->vlen = vlen;
+
+	return 0;
+}
+
+static struct characteristic *get_characteristic(struct input_device *idev,
+							const char *uuid)
+{
+	struct characteristic *chr;
+	GSList *l;
+
+	for (l = idev->chars; l; l = l->next) {
+		chr = l->data;
+		if (!strcasecmp(chr->type, uuid)) {
+			return chr;
+		}
+	}
+
+	DBG("get_characteristic returning NULL");
+	return NULL;
+}
+
+static void update_report_ref_desc_data(struct reference_desc *rrd_data,
+					struct input_device *idev)
+{
+	struct characteristic *chr;
+	GSList *l;
+	guint8 i = 0;
+
+	for (l = idev->chars; l; l = l->next) {
+		chr = l->data;
+		if (!strcasecmp(chr->type, HIDLE_REPORT_CHAR)) {
+			rrd_data[i].chr_hndl = chr->handle;
+			rrd_data[i].rep_id = chr->desc.report_id;
+			rrd_data[i].rep_type = chr->desc.report_type;
+			i++;
+		}
+	}
+}
+
+static int characteristic_handle_cmp(gconstpointer a, gconstpointer b)
+{
+	const struct characteristic *chr = a;
+	uint16_t handle = GPOINTER_TO_UINT(b);
+
+	return chr->handle - handle;
+}
+
+static void set_notification(const struct input_device *idev,
+				guint16 handle, gboolean enable)
+{
+	uint8_t atval[2];
+	uint16_t val;
+
+	if (!handle)
+		return;
+
+	if (enable)
+		val = 0x0001;
+	else
+		val = 0x0000;
+
+	att_put_u16(val, atval);
+
+	DBG("set notif %d for handle %d ", enable, handle);
+
+	gatt_write_char(idev->attrib, handle, atval, 2, NULL, idev);
+}
+
+static void hidp_set_notification(const struct input_device *idev,
+						gboolean enable)
+{
+	struct characteristic *chr;
+	GSList *l;
+	guint16 handle = 0;
+
+	for (l = idev->chars; l; l = l->next) {
+		chr = l->data;
+		if (!strcasecmp(chr->type, HIDLE_REPORT_CHAR)) {
+			if (chr->desc.cli_conf_hndl) {
+				handle = chr->desc.cli_conf_hndl;
+				set_notification(idev, handle, enable);
+			}
+		}
+	}
+}
+
+static int hidp_add_le_connection(const struct input_device *idev,
+				const struct input_conn *iconn)
+{
+	struct hidp_connadd_req *req;
+	struct characteristic *chr;
+	char src_addr[18], dst_addr[18];
+	int err;
+
+	DBG("HID LE conn add");
+
+	req = g_new0(struct hidp_connadd_req, 1);
+	req->att_sock = g_io_channel_unix_get_fd(iconn->att_io);
+	req->ctrl_sock = NULL;
+	req->intr_sock = NULL;
+	req->flags     = 0;
+	req->idle_to   = iconn->timeout;
+
+	ba2str(&idev->src, src_addr);
+	ba2str(&idev->dst, dst_addr);
+
+	read_device_id(src_addr, dst_addr, NULL,
+		&req->vendor, &req->product, &req->version);
+
+	DBG("vendor %04x product %04x version %04x",
+		req->vendor, req->product, req->version);
+
+	req->parser = 0x0100;
+	req->subclass = 0;
+	req->country = 0;
+	req->flags |= (1 << HIDP_VIRTUAL_CABLE_UNPLUG);
+
+	chr = get_characteristic(idev, HIDLE_REPORT_MAP_CHAR);
+	if (!chr)
+		return -EINVAL;
+
+	req->rd_data = g_try_malloc0(chr->vlen);
+	if (req->rd_data) {
+		memcpy(req->rd_data, (unsigned char *)chr->value, chr->vlen);
+		req->rd_size = chr->vlen;
+		epox_endian_quirk(req->rd_data, req->rd_size);
+	}
+
+	if (idev->rep_ref_desc_cnt) {
+		req->rrd_cnt = idev->rep_ref_desc_cnt;
+		req->rrd_data = g_try_malloc0(sizeof(struct descriptor)
+						*idev->rep_ref_desc_cnt);
+		if (req->rrd_data)
+			update_report_ref_desc_data(req->rrd_data, idev);
+	}
+
+	if (idev->name)
+		strncpy(req->name, idev->name, sizeof(req->name) - 1);
+
+	err = ioctl_connadd(req);
+
+	hidp_set_notification(idev, TRUE);
+
+cleanup:
+	free(req->rd_data);
+	if (req->rrd_data)
+		free(req->rrd_data);
+	g_free(req);
+
+	return err;
+}
+
+static void update_report_map_char_value(guint8 status, const guint8 *pdu,
+					guint16 len, gpointer user_data)
+{
+	struct characteristic *chr = user_data;
+	struct input_device *idev = chr->idev;
+	struct input_conn *iconn;
+	int err;
+
+	DBG("update report map char value status %d len %d", status, len);
+
+	if (status != 0) {
+		error("error status %d", status);
+		return;
+	}
+
+	characteristic_set_value(chr, pdu + 1, len - 1);
+}
+
+static void update_report_id_and_type(guint8 status, const guint8 *pdu,
+					guint16 plen, gpointer user_data)
+{
+	struct characteristic *chr = user_data;
+	struct input_device *idev = chr->idev;
+	struct input_conn *iconn;
+	static guint8 desc_cnt = 0;
+	int err;
+
+	if (status != 0) {
+		error("error status %d", status);
+		return;
+	}
+
+	DBG("report id = %02x report type = %02x", pdu[1], pdu[2]);
+
+	desc_cnt++;
+	chr->desc.report_id = pdu[1];
+	chr->desc.report_type = pdu[2];
+
+	if (idev->rep_ref_desc_cnt == desc_cnt) {
+
+		DBG("all report reference desc read");
+
+		iconn = find_connection(idev->connections, HIDLE_UUID);
+		if (iconn == NULL)
+			return;
+
+		err = hidp_add_le_connection(idev, iconn);
+		if (err < 0)
+			error("Can't connect to HID LE device: %s (%d)",
+							strerror(err), err);
+		desc_cnt = 0;
+	}
+}
+
+static void report_char_descriptor_cb(guint8 status, const guint8 *pdu,
+					guint16 plen, gpointer user_data)
+{
+	struct characteristic *chr = user_data;
+	struct input_device *idev = chr->idev;
+	struct att_data_list *list;
+	guint8 format;
+	int i;
+
+	if (status != 0) {
+		error("error status %d", status);
+		return;
+	}
+
+	DBG("Find Information Response received");
+
+	list = dec_find_info_resp(pdu, plen, &format);
+
+	for (i = 0; i < list->num; i++) {
+		guint16 handle;
+		bt_uuid_t uuid;
+		uint8_t *info = list->data[i];
+
+		handle = att_get_u16(info);
+
+		if (format == 0x01) {
+			uuid = att_get_uuid16(&info[2]);
+		} else {
+			/* Currently, only "user description" and "presentation
+			 * format" descriptors are used, and both have 16-bit
+			 * UUIDs. Therefore there is no need to support format
+			 * 0x02 yet. */
+			continue;
+		}
+
+		if (uuid_desc16_cmp(&uuid, GATT_CLIENT_CHARAC_CFG_UUID) == 0) {
+			DBG("client conf desc found at handle %d", handle);
+
+			chr->desc.cli_conf_hndl = handle;
+		} else if (uuid_desc16_cmp(&uuid, HIDLE_REPORT_REF_DESC) == 0) {
+			DBG("report reference desc handle %04x", handle);
+
+			idev->rep_ref_desc_cnt++;
+			chr->desc.handle = handle;
+			gatt_read_char(idev->attrib, handle, 0,
+					update_report_id_and_type, chr);
+		}
+
+	}
+
+	att_data_list_free(list);
+}
+
+static void char_discovered_cb(GSList *characteristics, guint8 status,
+						gpointer user_data)
+{
+	struct input_device *idev = user_data;
+	GSList *l;
+	uint16_t *previous_end = NULL;
+
+	DBG("");
+
+	if (status != 0) {
+		const char *str = att_ecode2str(status);
+		error("Discover all characteristics failed: %s", str);
+		goto fail;
+	}
+
+	for (l = characteristics; l; l = l->next) {
+		struct att_char *current_chr = l->data;
+		struct characteristic *chr;
+		guint end = 0, handle = current_chr->value_handle;
+		GSList *lchr;
+
+		lchr = g_slist_find_custom(idev->chars,
+			GUINT_TO_POINTER(handle), characteristic_handle_cmp);
+		if (lchr)
+			continue;
+
+		chr = g_new0(struct characteristic, 1);
+		chr->perm = current_chr->properties;
+		chr->handle = current_chr->value_handle;
+		strncpy(chr->type, current_chr->uuid, sizeof(chr->type));
+		chr->idev = idev;
+
+		if (previous_end)
+			*previous_end = current_chr->handle;
+
+		previous_end = &chr->end;
+
+		idev->chars = g_slist_append(idev->chars, chr);
+
+		DBG("char uuid %s, perm %02x, start=%04x end=%04x",
+					current_chr->uuid, chr->perm,
+					current_chr->handle, chr->handle);
+
+		if (!strcasecmp(current_chr->uuid, HIDLE_REPORT_MAP_CHAR)) {
+			gatt_read_char(idev->attrib, chr->handle, 0,
+					update_report_map_char_value, chr);
+
+		} else if (!strcasecmp(current_chr->uuid, HIDLE_REPORT_CHAR)) {
+			if (chr->perm & ATT_CHAR_PROPER_NOTIFY)
+				end = chr->handle + 2;
+			else
+				end = chr->handle + 1;
+
+			gatt_find_info(idev->attrib, chr->handle + 1, end,
+					report_char_descriptor_cb, chr);
+		}
+	}
+
+	if (previous_end)
+		*previous_end = idev->att_prim->end;
+
+	return;
+
+fail:
+	g_attrib_unref(idev->attrib);
+}
+
+static void update_device_id_info(guint8 status, const guint8 *pdu,
+					guint16 plen, gpointer user_data)
+{
+	struct input_device *idev = user_data;
+	uint16_t source, vendor, product, version;
+	char srcaddr[18], dstaddr[18];
+	struct att_data_list *list;
+	uint8_t *value;
+
+	if (status != 0) {
+		g_printerr("Read characteristics by UUID failed: %s\n",
+						att_ecode2str(status));
+		return;
+	}
+
+	list = dec_read_by_type_resp(pdu, plen);
+	if (list == NULL)
+		return;
+
+	value = list->data[0];
+
+	source = value[2];
+	vendor = ((value[3] << 8) | value[4]);
+	product = ((value[5] << 8) | value[6]);
+	version = ((value[7] << 8) | value[8]);
+
+	DBG("source %02x vendor %04x product %04x version %04x",
+				source, vendor, product, version);
+
+	ba2str(&idev->src, srcaddr);
+	ba2str(&idev->dst, dstaddr);
+
+	if (source || vendor || product || version)
+		store_device_id(srcaddr, dstaddr, source,
+				vendor, product, version);
+
+	att_data_list_free(list);
+}
+
+static void hidp_le_get_did(const struct input_device *idev)
+{
+	struct att_primary *att;
+	GSList *prim_list, *l;
+
+	prim_list = btd_device_get_primaries(idev->device);
+	if (prim_list == NULL) {
+		error("prim_list is null");
+		return;
+	}
+
+	for (l = prim_list; l; l = l->next) {
+		att = l->data;
+		if (!strcasecmp(att->uuid, DEVICE_INFO_UUID)) {
+			uint16_t pnp_id = PNP_CHAR_UUID;
+			bt_uuid_t pnp_uuid = att_get_uuid16(&pnp_id);
+
+			DBG("reading PnP_ID in range start = %d end = %d",
+							att->start, att->end);
+
+			gatt_read_char_by_uuid(idev->attrib, att->start,
+						att->end, &pnp_uuid,
+						update_device_id_info, idev);
+			break;
+		}
+	}
+}
+
 static int hidp_add_connection(const struct input_device *idev,
 				const struct input_conn *iconn)
 {
@@ -579,9 +1088,33 @@ static int hidp_add_connection(const struct input_device *idev,
 	char src_addr[18], dst_addr[18];
 	int err;
 
+	if (device_is_le(idev->device)) {
+		if (idev->rep_ref_desc_cnt) {
+			DBG("char already discovered so donot repeat");
+
+			err = hidp_add_le_connection(idev, iconn);
+			if (err < 0)
+				error("Can't connect to HID LE device: %s (%d)",
+							strerror(err), err);
+			return err;
+		}
+
+		DBG("LE HID discover char");
+
+		hidp_le_get_did(idev);
+
+		gatt_discover_char(idev->attrib, idev->att_prim->start,
+						idev->att_prim->end, NULL,
+						char_discovered_cb, idev);
+		return 0;
+	}
+
 	req = g_new0(struct hidp_connadd_req, 1);
 	req->ctrl_sock = g_io_channel_unix_get_fd(iconn->ctrl_io);
 	req->intr_sock = g_io_channel_unix_get_fd(iconn->intr_io);
+	req->att_sock = NULL;
+	req->rrd_data = NULL;
+	req->rrd_cnt = 0;
 	req->flags     = 0;
 	req->idle_to   = iconn->timeout;
 
@@ -696,6 +1229,8 @@ static int connection_disconnect(struct input_conn *iconn, uint32_t flags)
 		g_io_channel_shutdown(iconn->intr_io, TRUE, NULL);
 	if (iconn->ctrl_io)
 		g_io_channel_shutdown(iconn->ctrl_io, TRUE, NULL);
+	if(iconn->att_io)
+		g_io_channel_shutdown(iconn->att_io, TRUE, NULL);
 
 	ctl = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HIDP);
 	if (ctl < 0) {
@@ -769,19 +1304,24 @@ static int input_device_connected(struct input_device *idev,
 	dbus_bool_t connected;
 	int err;
 
-	if (iconn->intr_io == NULL || iconn->ctrl_io == NULL)
-		return -ENOTCONN;
+	DBG("");
 
 	err = hidp_add_connection(idev, iconn);
 	if (err < 0)
 		return err;
 
-	iconn->intr_watch = g_io_add_watch(iconn->intr_io,
+	if (device_is_bredr(idev->device)) {
+		iconn->intr_watch = g_io_add_watch(iconn->intr_io,
 					G_IO_HUP | G_IO_ERR | G_IO_NVAL,
 					intr_watch_cb, iconn);
-	iconn->ctrl_watch = g_io_add_watch(iconn->ctrl_io,
+		iconn->ctrl_watch = g_io_add_watch(iconn->ctrl_io,
 					G_IO_HUP | G_IO_ERR | G_IO_NVAL,
 					ctrl_watch_cb, iconn);
+	} else if (device_is_le(idev->device)) {
+		iconn->att_watch = g_io_add_watch(iconn->att_io,
+					G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+					att_watch_cb, iconn);
+	}
 
 	connected = TRUE;
 	emit_property_changed(idev->conn, idev->path, INPUT_DEVICE_INTERFACE,
@@ -886,6 +1426,52 @@ failed:
 	iconn->pending_connect = NULL;
 }
 
+static void att_connect_cb(GIOChannel *chan, GError *conn_err,
+						gpointer user_data)
+{
+	struct input_conn *iconn = user_data;
+	struct input_device *idev = iconn->idev;
+	DBusMessage *reply;
+	int err;
+	const char *err_msg;
+
+	DBG("gatt connect cb");
+
+	if (idev->attrib == NULL) {
+		error("attrib null");
+		return;
+	}
+
+	if (conn_err) {
+		err_msg = conn_err->message;
+		goto failed;
+	}
+
+	err = input_device_connected(idev, iconn);
+	if (err < 0) {
+		err_msg = strerror(-err);
+		goto failed;
+	}
+
+	/* Replying to the requestor */
+	g_dbus_send_reply(idev->conn, iconn->pending_connect, DBUS_TYPE_INVALID);
+
+	dbus_message_unref(iconn->pending_connect);
+	iconn->pending_connect = NULL;
+
+	return;
+
+failed:
+	error("%s", err_msg);
+	reply = btd_error_failed(iconn->pending_connect, err_msg);
+	g_dbus_send_message(idev->conn, reply);
+
+	if (iconn->att_io) {
+		g_io_channel_unref(iconn->att_io);
+		iconn->att_io = NULL;
+	}
+}
+
 static int fake_disconnect(struct input_conn *iconn)
 {
 	struct fake_input *fake = iconn->fake;
@@ -939,7 +1525,31 @@ static DBusMessage *input_device_connect(DBusConnection *conn,
 		/* HID devices */
 		GIOChannel *io;
 
-		io = bt_io_connect(BT_IO_L2CAP, control_connect_cb, iconn,
+		if (device_is_le(idev->device)) {
+			DBG("LE HID connect");
+
+			io = bt_io_connect(BT_IO_L2CAP, att_connect_cb,
+					iconn, NULL, &err,
+					BT_IO_OPT_SOURCE_BDADDR, &idev->src,
+					BT_IO_OPT_DEST_BDADDR, &idev->dst,
+					BT_IO_OPT_CID, ATT_CID,
+					BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_LOW,
+					BT_IO_OPT_INVALID);
+
+			iconn->att_io = io;
+			idev->attrib = g_attrib_new(io);
+			idev->attrib = g_attrib_ref(idev->attrib);
+			g_io_channel_unref(io);
+
+			g_attrib_set_destroy_function(idev->attrib,
+							attrib_destroy, idev);
+			g_attrib_set_disconnect_function(idev->attrib,
+							attrib_disconnect, idev);
+
+               } else {
+			DBG("BREDR HID connect");
+
+			io = bt_io_connect(BT_IO_L2CAP, control_connect_cb, iconn,
 					NULL, &err,
 					BT_IO_OPT_SOURCE_BDADDR, &idev->src,
 					BT_IO_OPT_DEST_BDADDR, &idev->dst,
@@ -947,7 +1557,8 @@ static DBusMessage *input_device_connect(DBusConnection *conn,
 					BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_LOW,
 					BT_IO_OPT_POWER_ACTIVE, 0,
 					BT_IO_OPT_INVALID);
-		iconn->ctrl_io = io;
+			iconn->ctrl_io = io;
+		}
 	}
 
 	if (err == NULL)
@@ -1041,6 +1652,7 @@ static struct input_device *input_device_new(DBusConnection *conn,
 					const uint32_t handle)
 {
 	struct input_device *idev;
+	struct att_primary *att;
 	char name[249], src_addr[18], dst_addr[18];
 
 	idev = g_new0(struct input_device, 1);
@@ -1050,6 +1662,28 @@ static struct input_device *input_device_new(DBusConnection *conn,
 	idev->path = g_strdup(path);
 	idev->conn = dbus_connection_ref(conn);
 	idev->handle = handle;
+	idev->att_prim = NULL;
+
+	if (device_is_le(idev->device)) {
+		GSList *prim_list, *l;
+
+		prim_list = btd_device_get_primaries(idev->device);
+		if (prim_list == NULL) {
+			error("prim_list is null");
+			return NULL;
+		}
+
+		for (l = prim_list; l; l = l->next) {
+			att = l->data;
+			if (!strcasecmp(att->uuid, HIDLE_UUID)) {
+				DBG("uuid matched start = %d end = %d",
+							att->start, att->end);
+				idev->att_prim = att;
+				idev->handle = att->start;
+				break;
+			}
+		}
+	}
 
 	ba2str(src, src_addr);
 	ba2str(dst, dst_addr);
@@ -1205,6 +1839,11 @@ error:
 		g_io_channel_unref(iconn->intr_io);
 		iconn->intr_io = NULL;
 	}
+	if (iconn->att_io) {
+		g_io_channel_shutdown(iconn->att_io, FALSE, NULL);
+		g_io_channel_unref(iconn->att_io);
+		iconn->att_io = NULL;
+	}
 
 	return err;
 }
@@ -1235,7 +1874,7 @@ int input_device_set_channel(const bdaddr_t *src, const bdaddr_t *dst, int psm,
 		break;
 	}
 
-	if (iconn->intr_io && iconn->ctrl_io)
+	if ((iconn->intr_io && iconn->ctrl_io) || iconn->att_io)
 		input_device_connadd(idev, iconn);
 
 	return 0;
@@ -1258,6 +1897,9 @@ int input_device_close_channels(const bdaddr_t *src, const bdaddr_t *dst)
 
 	if (iconn->ctrl_io)
 		g_io_channel_shutdown(iconn->ctrl_io, TRUE, NULL);
+
+	if (iconn->att_io)
+		g_io_channel_shutdown(iconn->att_io, TRUE, NULL);
 
 	return 0;
 }

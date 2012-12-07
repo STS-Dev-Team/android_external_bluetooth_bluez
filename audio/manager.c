@@ -4,7 +4,7 @@
  *
  *  Copyright (C) 2006-2010  Nokia Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
- *
+ *  Copyright (C) 2012, Code Aurora Forum. All rights reserved.
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -45,6 +45,7 @@
 #include <glib.h>
 #include <dbus/dbus.h>
 #include <gdbus.h>
+#include <cutils/properties.h>
 
 #include "glib-helper.h"
 #include "btio.h"
@@ -222,8 +223,11 @@ static void handle_uuid(const char *uuidstr, struct audio_device *device)
 			control_update(device, uuid16);
 		else
 			device->control = control_init(device, uuid16);
+		/* this should be for incoming connection, so posting delayed
+		 * connect on avrcp for all devices.
+		 */
 		if (device->sink && sink_is_active(device))
-			avrcp_connect(device);
+			audio_device_set_control_timer(device);
 		break;
 	default:
 		DBG("Unrecognized UUID: 0x%04X", uuid16);
@@ -355,6 +359,7 @@ static sdp_record_t *hfp_ag_record(uint8_t ch, uint32_t feat)
 	uint8_t netid = 0x01;
 	uint16_t sdpfeat;
 	sdp_data_t *network;
+	char value[PROPERTY_VALUE_MAX] = "";
 
 	record = sdp_record_alloc();
 	if (!record)
@@ -377,7 +382,11 @@ static sdp_record_t *hfp_ag_record(uint8_t ch, uint32_t feat)
 	sdp_set_service_classes(record, svclass_id);
 
 	sdp_uuid16_create(&profile.uuid, HANDSFREE_PROFILE_ID);
-	profile.version = 0x0105;
+	property_get("ro.qualcomm.bluetooth.hfp.wbs", value, "");
+	if (!strcmp("true", value))
+		profile.version = 0x0106;
+	else
+		profile.version = 0x0105;
 	pfseq = sdp_list_append(0, &profile);
 	sdp_set_profile_descs(record, pfseq);
 
@@ -391,7 +400,12 @@ static sdp_record_t *hfp_ag_record(uint8_t ch, uint32_t feat)
 	proto[1] = sdp_list_append(proto[1], channel);
 	apseq = sdp_list_append(apseq, proto[1]);
 
-	sdpfeat = (uint16_t) feat & 0xF;
+	sdpfeat = (uint16_t) feat & 0x1F;
+	/* Due to inconsistency "SupportedFeatures" bitmap for Bit 5
+	 * between Service Record and AT+BRSF
+	 * Bit 5: Wide band speech */
+	if (!strcmp("true", value))
+		sdpfeat |= 0x20;
 	features = sdp_data_alloc(SDP_UINT16, &sdpfeat);
 	sdp_attr_add(record, SDP_ATTR_SUPPORTED_FEATURES, features);
 
@@ -775,7 +789,7 @@ static int audio_probe(struct btd_device *device, GSList *uuids)
 	struct audio_device *audio_dev;
 
 	adapter_get_address(adapter, &src);
-	device_get_address(device, &dst);
+	device_get_address(device, &dst, NULL);
 
 	audio_dev = manager_get_device(&src, &dst, TRUE);
 	if (!audio_dev) {

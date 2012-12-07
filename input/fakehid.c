@@ -33,6 +33,7 @@
 #include <sys/types.h>
 
 #include <bluetooth/bluetooth.h>
+#include <bluetooth/uuid.h>
 #include <bluetooth/hidp.h>
 #include <bluetooth/sdp.h>
 

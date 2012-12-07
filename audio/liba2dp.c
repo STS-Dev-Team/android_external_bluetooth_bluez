@@ -4,6 +4,7 @@
  *
  *  Copyright (C) 2006-2007  Nokia Corporation
  *  Copyright (C) 2004-2008  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -47,27 +48,31 @@
 #include "rtp.h"
 #include "liba2dp.h"
 
-#define LOG_NDEBUG 0
-#define LOG_TAG "A2DP"
-#include <utils/Log.h>
-
+#ifdef ENABLE_TIMING
 #define ENABLE_DEBUG
-/* #define ENABLE_VERBOSE */
-/* #define ENABLE_TIMING */
+#define ENABLE_VERBOSE
+#endif
 
-#define BUFFER_SIZE 2048
+#ifdef ENABLE_CSR_APTX_CODEC
+#include "aptXbtenc.h"
+#endif //ENABLE_CSR_APTX_CODEC
 
 #ifdef ENABLE_DEBUG
+#define LOG_NDDEBUG 0
 #define DBG LOGD
 #else
 #define DBG(fmt, arg...)
 #endif
 
 #ifdef ENABLE_VERBOSE
+#define LOG_NDEBUG 0
 #define VDBG LOGV
 #else
 #define VDBG(fmt, arg...)
 #endif
+
+#define LOG_TAG "A2DP"
+#include <utils/Log.h>
 
 #ifndef MIN
 # define MIN(x, y) ((x) < (y) ? (x) : (y))
@@ -98,6 +103,26 @@
 /* timeout in seconds for command socket recv() */
 #define RECV_TIMEOUT			5
 
+
+#ifdef ENABLE_CSR_APTX_CODEC
+#define BUFFER_SIZE 4096
+#else
+#define BUFFER_SIZE 2048
+#endif
+
+#ifdef ENABLE_CSR_APTX_CODEC
+/* btaptx local data stracture
+ * btaptx_struct could be removed as we are not using it....however,
+ * it is just to keep symmetry with SBC implementation as much as possible. */
+
+struct btaptx_struct {
+	unsigned long flags;
+	int frequency;
+	int mode;
+	int endian;
+};
+typedef struct btaptx_struct btaptx_t;
+#endif //ENABLE_CSR_APTX_CODEC
 
 typedef enum {
 	A2DP_STATE_NONE = 0,
@@ -136,8 +161,13 @@ struct bluetooth_data {
 	int	frame_duration;			/* length of an SBC frame in microseconds */
 	int codesize;				/* SBC codesize */
 	int samples;				/* Number of encoded samples */
+	size_t sizeof_scms_t;                   /* Indicates protection hdr */
+	uint8_t scms_t_cp_header;		/* Protection header to use */
 	uint8_t buffer[BUFFER_SIZE];		/* Codec transfer buffer */
 	int count;				/* Codec transfer buffer counter */
+
+	int codec_configured;
+	int codec_supported_remote;
 
 	int nsamples;				/* Cumulative number of codec samples */
 	uint16_t seq_num;			/* Cumulative packet sequence */
@@ -149,7 +179,21 @@ struct bluetooth_data {
 
 	/* used for pacing our writes to the output socket */
 	uint64_t	next_write;
+	uint8_t isEdrCapable;
+	uint8_t stream_suspended;
+
+#ifdef ENABLE_CSR_APTX_CODEC
+	btaptx_capabilities_t btaptx_capabilities;
+	btaptx_t btaptx;
+	void    *aptxCodec;
+#endif //ENABLE_CSR_APTX_CODEC
+	int codec_priority;
+
 };
+
+#define CP_TYPE_SCMS_T 		0x0002
+#define SCMS_T_COPY_ALLOWED	0x00
+#define SCMS_T_COPY_NOT_ALLOWED 0x02
 
 static uint64_t get_microseconds()
 {
@@ -168,14 +212,41 @@ static void print_time(const char* message, uint64_t then, uint64_t now)
 static int audioservice_send(struct bluetooth_data *data, const bt_audio_msg_header_t *msg);
 static int audioservice_expect(struct bluetooth_data *data, bt_audio_msg_header_t *outmsg,
 				int expected_type);
+
+#ifdef ENABLE_CSR_APTX_CODEC
+static int bluetooth_a2dp_btaptx_hw_params(struct bluetooth_data *data);
+#endif //ENABLE_CSR_APTX_CODEC
+
 static int bluetooth_a2dp_hw_params(struct bluetooth_data *data);
 static void set_state(struct bluetooth_data *data, a2dp_state_t state);
+static int audioservice_stream_unavailable(struct bluetooth_data *data);
 
 
 static void bluetooth_close(struct bluetooth_data *data)
 {
 	DBG("bluetooth_close");
 	if (data->server.fd >= 0) {
+		// sending BT_CLOSE to cleanup unix socket.
+		char buf[BT_SUGGESTED_BUFFER_SIZE];
+		struct bt_close_req *close_req = (void*) buf;
+		struct bt_close_rsp *close_rsp = (void*) buf;
+		int err;
+		memset(close_req, 0, BT_SUGGESTED_BUFFER_SIZE);
+		close_req->h.type = BT_REQUEST;
+		close_req->h.name = BT_CLOSE;
+
+		close_req->h.length = sizeof(*close_req);
+
+		err = audioservice_send(data, &close_req->h);
+		if (err < 0) {
+			ERR("audioservice_send failed for BT_CLOSE_REQ\n");
+		} else {
+			close_rsp->h.length = 0;
+			err = audioservice_expect(data, &close_rsp->h, BT_CLOSE);
+			if (err < 0) {
+				ERR("audioservice_expect failed for BT_CLOSE_RSP\n");
+			}
+		}
 		bt_audio_service_close(data->server.fd);
 		data->server.fd = -1;
 	}
@@ -259,7 +330,7 @@ static int bluetooth_start(struct bluetooth_data *data)
 	setsockopt(data->stream.fd, SOL_SOCKET, SO_SNDBUF, &bytes,
 			sizeof(bytes));
 
-	data->count = sizeof(struct rtp_header) + sizeof(struct rtp_payload);
+	data->count = sizeof(struct rtp_header) + sizeof(struct rtp_payload) + data->sizeof_scms_t;
 	data->frame_count = 0;
 	data->samples = 0;
 	data->nsamples = 0;
@@ -317,7 +388,7 @@ error:
 	return err;
 }
 
-static uint8_t default_bitpool(uint8_t freq, uint8_t mode)
+static uint8_t high_quality_default_bitpool(uint8_t freq, uint8_t mode)
 {
 	switch (freq) {
 	case BT_SBC_SAMPLING_FREQ_16000:
@@ -353,11 +424,47 @@ static uint8_t default_bitpool(uint8_t freq, uint8_t mode)
 	}
 }
 
+static uint8_t medium_quality_default_bitpool(uint8_t freq, uint8_t mode)
+{
+	switch (freq) {
+	case BT_SBC_SAMPLING_FREQ_16000:
+	case BT_SBC_SAMPLING_FREQ_32000:
+		return 35;
+	case BT_SBC_SAMPLING_FREQ_44100:
+		switch (mode) {
+		case BT_A2DP_CHANNEL_MODE_MONO:
+		case BT_A2DP_CHANNEL_MODE_DUAL_CHANNEL:
+			return 19;
+		case BT_A2DP_CHANNEL_MODE_STEREO:
+		case BT_A2DP_CHANNEL_MODE_JOINT_STEREO:
+			return 35;
+		default:
+			ERR("Invalid channel mode %u", mode);
+			return 35;
+		}
+	case BT_SBC_SAMPLING_FREQ_48000:
+		switch (mode) {
+		case BT_A2DP_CHANNEL_MODE_MONO:
+		case BT_A2DP_CHANNEL_MODE_DUAL_CHANNEL:
+			return 18;
+		case BT_A2DP_CHANNEL_MODE_STEREO:
+		case BT_A2DP_CHANNEL_MODE_JOINT_STEREO:
+			return 33;
+		default:
+			ERR("Invalid channel mode %u", mode);
+			return 33;
+		}
+	default:
+		ERR("Invalid sampling freq %u", freq);
+		return 35;
+	}
+}
+
 static int bluetooth_a2dp_init(struct bluetooth_data *data)
 {
 	sbc_capabilities_t *cap = &data->sbc_capabilities;
 	unsigned int max_bitpool, min_bitpool;
-	int dir;
+	int dir, def_bitpool;
 
 	switch (data->rate) {
 	case 48000:
@@ -421,10 +528,14 @@ static int bluetooth_a2dp_init(struct bluetooth_data *data)
 	else if (cap->allocation_method & BT_A2DP_ALLOCATION_SNR)
 		cap->allocation_method = BT_A2DP_ALLOCATION_SNR;
 
+		def_bitpool = (data->isEdrCapable) ?
+				high_quality_default_bitpool(cap->frequency,
+								 cap->channel_mode) :
+				medium_quality_default_bitpool(cap->frequency,
+								cap->channel_mode);
+
 		min_bitpool = MAX(MIN_BITPOOL, cap->min_bitpool);
-		max_bitpool = MIN(default_bitpool(cap->frequency,
-					cap->channel_mode),
-					cap->max_bitpool);
+		max_bitpool = MIN(def_bitpool, cap->max_bitpool);
 
 	cap->min_bitpool = min_bitpool;
 	cap->max_bitpool = max_bitpool;
@@ -624,7 +735,14 @@ static int bluetooth_a2dp_hw_params(struct bluetooth_data *data)
 		return err;
 
 	data->link_mtu = setconf_rsp->link_mtu;
-	DBG("MTU: %d", data->link_mtu);
+	if (setconf_rsp->content_protection == CP_TYPE_SCMS_T) {
+		data->sizeof_scms_t = 1;
+		data->scms_t_cp_header = SCMS_T_COPY_NOT_ALLOWED;
+	} else {
+		data->sizeof_scms_t = 0;
+		data->scms_t_cp_header = SCMS_T_COPY_ALLOWED;
+	}
+	DBG("MTU: %d -- SCMS-T Enabled: %d", data->link_mtu, setconf_rsp->content_protection);
 
 	/* Setup SBC encoder now we agree on parameters */
 	bluetooth_a2dp_setup(data);
@@ -638,7 +756,7 @@ static int bluetooth_a2dp_hw_params(struct bluetooth_data *data)
 
 static int avdtp_write(struct bluetooth_data *data)
 {
-	int ret = 0;
+	int ret = 0, sig_ret=0;
 	struct rtp_header *header;
 	struct rtp_payload *payload;
 
@@ -650,10 +768,13 @@ static int avdtp_write(struct bluetooth_data *data)
 #endif
 
 	header = (struct rtp_header *)data->buffer;
-	payload = (struct rtp_payload *)(data->buffer + sizeof(*header));
+	payload = (struct rtp_payload *)(data->buffer + sizeof(*header) + data->sizeof_scms_t);
 
-	memset(data->buffer, 0, sizeof(*header) + sizeof(*payload));
+	memset(data->buffer, 0, sizeof(*header) + sizeof(*payload) + data->sizeof_scms_t);
 
+	if (data->sizeof_scms_t) {
+		data->buffer[sizeof(*header)] = data->scms_t_cp_header;
+	}
 	payload->frame_count = data->frame_count;
 	header->v = 2;
 	header->pt = 1;
@@ -670,34 +791,42 @@ static int avdtp_write(struct bluetooth_data *data)
 	end2 = get_microseconds();
 	print_time("poll", begin2, end2);
 #endif
-	if (ret == 1 && data->stream.revents == POLLOUT) {
-		long ahead = 0;
-		now = get_microseconds();
+	long ahead = 0;
+	now = get_microseconds();
 
-		if (data->next_write) {
-			ahead = data->next_write - now;
+	sig_ret = poll(&data->server, 1, 10);
+	DBG("ret on server fd is %d",sig_ret);
+	if (sig_ret)
+		data->stream_suspended = audioservice_stream_unavailable(data);
+
+	if (data->next_write) {
+		ahead = data->next_write - now;
 #ifdef ENABLE_TIMING
-			DBG("duration: %ld, ahead: %ld", duration, ahead);
+		DBG("duration: %ld, ahead: %ld", duration, ahead);
 #endif
-			if (ahead > 0) {
-				/* too fast, need to throttle */
-				usleep(ahead);
-			}
-		} else {
-			data->next_write = now;
+		if (ahead > 0) {
+			/* too fast, need to throttle */
+			usleep(ahead);
 		}
-		if (ahead <= -CATCH_UP_TIMEOUT * 1000) {
-			/* fallen too far behind, don't try to catch up */
-			VDBG("ahead < %d, reseting next_write timestamp", -CATCH_UP_TIMEOUT * 1000);
-			data->next_write = 0;
-		} else {
-			data->next_write += duration;
-		}
+	} else {
+		data->next_write = now;
+	}
+	if (ahead <= -CATCH_UP_TIMEOUT * 1000) {
+		/* fallen too far behind, don't try to catch up */
+		VDBG("ahead < %d, reseting next_write timestamp", -CATCH_UP_TIMEOUT * 1000);
+		data->next_write = 0;
+	} else {
+		data->next_write += duration;
+	}
 
+	if (ret == 1 && data->stream.revents == POLLOUT) {
 #ifdef ENABLE_TIMING
 		begin2 = get_microseconds();
 #endif
-		ret = send(data->stream.fd, data->buffer, data->count, MSG_NOSIGNAL);
+		if (data->stream_suspended)
+			ret = 1; //drop  the frames in suspend case
+		else
+			ret = send(data->stream.fd, data->buffer, data->count, MSG_NOSIGNAL);
 #ifdef ENABLE_TIMING
 		end2 = get_microseconds();
 		print_time("send", begin2, end2);
@@ -713,11 +842,10 @@ static int avdtp_write(struct bluetooth_data *data)
 		/* can happen during normal remote disconnect */
 		VDBG("poll() failed: %d (revents = %d, errno %s)",
 				ret, data->stream.revents, strerror(errno));
-		data->next_write = 0;
 	}
 
 	/* Reset buffer of data to send */
-	data->count = sizeof(struct rtp_header) + sizeof(struct rtp_payload);
+	data->count = sizeof(struct rtp_header) + sizeof(struct rtp_payload) + data->sizeof_scms_t;
 	data->frame_count = 0;
 	data->samples = 0;
 	data->seq_num++;
@@ -745,8 +873,10 @@ static int audioservice_send(struct bluetooth_data *data,
 		err = -errno;
 		ERR("Error sending data to audio service: %s(%d)",
 			strerror(errno), errno);
-		if (err == -EPIPE)
+		if (err == -EPIPE || err == -ECONNRESET) {
+			data->server.fd = -1;
 			bluetooth_close(data);
+		}
 	}
 
 	return err;
@@ -766,8 +896,10 @@ static int audioservice_recv(struct bluetooth_data *data,
 		err = -errno;
 		ERR("Error receiving IPC data from bluetoothd: %s (%d)",
 						strerror(errno), errno);
-		if (err == -EPIPE)
+		if (err == -EPIPE || err == -ECONNRESET) {
+			data->server.fd = -1;
 			bluetooth_close(data);
+		}
 	} else if ((size_t) ret < sizeof(bt_audio_msg_header_t)) {
 		ERR("Too short (%d bytes) IPC packet from bluetoothd", ret);
 		err = -EINVAL;
@@ -823,6 +955,27 @@ static int audioservice_expect(struct bluetooth_data *data,
 
 }
 
+static int audioservice_stream_unavailable(struct bluetooth_data *data)
+{
+	char buf[BT_SUGGESTED_BUFFER_SIZE];
+	struct bt_suspend_stream_ind *suspend_ind = (void*) buf;
+	bt_audio_msg_header_t *rsp_hdr = &suspend_ind->h;
+	int err = audioservice_recv(data, rsp_hdr);
+
+	if (err != 0)
+		return 0;
+
+	if (rsp_hdr->name == BT_SUSPEND_STREAM) {
+		DBG("it is stream suspend posted");
+		return 1;
+	} else if (rsp_hdr->name == BT_RESUME_STREAM) {
+		DBG("it is stream resume posted");
+	}
+
+	DBG("response header read is %d",rsp_hdr->name);
+	return 0;
+}
+
 static int bluetooth_init(struct bluetooth_data *data)
 {
 	int sk, err;
@@ -854,14 +1007,69 @@ static int bluetooth_parse_capabilities(struct bluetooth_data *data,
 {
 	int bytes_left = rsp->h.length - sizeof(*rsp);
 	codec_capabilities_t *codec = (void *) rsp->data;
+	data->codec_priority = 0;
+
+	DBG("bluetooth_parse_capabilities codec %d %d ",codec->type,
+							codec->transport);
+
+	memset(&data->sbc_capabilities , 0 , sizeof(data->sbc_capabilities));
+#ifdef ENABLE_CSR_APTX_CODEC
+	memset(&data->btaptx_capabilities , 0 , sizeof(data->btaptx_capabilities));
+#endif //ENABLE_CSR_APTX_CODEC
 
 	if (codec->transport != BT_CAPABILITIES_TRANSPORT_A2DP)
 		return -EINVAL;
 
+	data->codec_priority = 0;
+	data->codec_supported_remote = 0;
+
 	while (bytes_left > 0) {
-		if ((codec->type == BT_A2DP_SBC_SINK) &&
-			!(codec->lock & BT_WRITE_LOCK))
-			break;
+#ifdef ENABLE_CSR_APTX_CODEC
+		if (codec->type == BT_A2DP_BTAPTX_SINK) {
+			DBG("bluetooth_parse_capabilities codec APTX");
+			if (bytes_left <= 0 ||
+					codec->length != sizeof(data->btaptx_capabilities))
+				return -EINVAL;
+			data->codec_priority = 2;
+			data->codec_supported_remote = data->codec_supported_remote | (1 << BT_A2DP_BTAPTX_SINK);
+			DBG("codec supported remote = %d\n", data->codec_supported_remote);
+			memcpy(&data->btaptx_capabilities, codec, codec->length);
+
+			DBG("aptx codec ID0 = %u\n ",  data->btaptx_capabilities.codec_id0);
+			DBG("aptx codec ID1 = %u\n ",  data->btaptx_capabilities.codec_id1);
+			DBG("aptx Vendor ID0 = %u\n ", data->btaptx_capabilities.vender_id0);
+			DBG("aptx Vendor ID1 = %u\n ", data->btaptx_capabilities.vender_id1);
+			DBG("aptx Vendor ID2 = %u\n ", data->btaptx_capabilities.vender_id2);
+			DBG("aptx Vendor ID3 = %u\n ", data->btaptx_capabilities.vender_id3);
+			DBG("aptx channel mode = %u\n", data->btaptx_capabilities.channel_mode);
+			DBG("aptx frequency = %u\n ",  data->btaptx_capabilities.frequency);
+
+		} else
+#endif //ENABLE_CSR_APTX_CODEC
+
+		if (codec->type == BT_A2DP_SBC_SINK) {
+			DBG("bluetooth_parse_capabilities codec SBC");
+			if (bytes_left <= 0 ||
+					codec->length != sizeof(data->sbc_capabilities))
+				return -EINVAL;
+
+			memcpy(&data->sbc_capabilities, codec, codec->length);
+
+			data->codec_priority=0;
+			data->codec_supported_remote = data->codec_supported_remote |
+								(1 << BT_A2DP_SBC_SINK);
+			data->codec_configured = A2DP_CODEC_SBC;
+
+			DBG("SBC channel mode = %u ",data->sbc_capabilities.channel_mode);
+			DBG("SBC frequency = %u ",data->sbc_capabilities.frequency);
+			DBG("SBC allocation_method= %u",data->sbc_capabilities.allocation_method);
+			DBG("SBC subbands = %u ",data->sbc_capabilities.subbands);
+			DBG("SBC block_length = %u ", data->sbc_capabilities.block_length);
+			DBG("SBC min_bitpool = %u ", data->sbc_capabilities.min_bitpool);
+			DBG("SBC max_bitpool = %u ", data->sbc_capabilities.max_bitpool);
+		} else {
+			DBG("Unknown codec type or not supported\n");
+		}
 
 		if (codec->length == 0) {
 			ERR("bluetooth_parse_capabilities() invalid codec capabilities length");
@@ -871,11 +1079,7 @@ static int bluetooth_parse_capabilities(struct bluetooth_data *data,
 		codec = (codec_capabilities_t *)((char *)codec + codec->length);
 	}
 
-	if (bytes_left <= 0 ||
-			codec->length != sizeof(data->sbc_capabilities))
-		return -EINVAL;
-
-	memcpy(&data->sbc_capabilities, codec, codec->length);
+	data->isEdrCapable = rsp->isEdrCapable;
 	return 0;
 }
 
@@ -919,9 +1123,30 @@ static int bluetooth_configure(struct bluetooth_data *data)
 		goto error;
 	}
 
-	err = bluetooth_a2dp_hw_params(data);
-	if (err < 0) {
-		ERR("bluetooth_a2dp_hw_params failed err: %d", err);
+#ifdef ENABLE_CSR_APTX_CODEC
+	if ((data->codec_supported_remote & (1 << BT_A2DP_BTAPTX_SINK)) != 0) {
+		DBG("btaptx codec found : calling \
+			bluetooth_a2dp_btaptx_hw_params ");
+		err = bluetooth_a2dp_btaptx_hw_params(data);
+		if (err < 0) {
+			ERR("bluetooth_a2dp_btaptx_hw_params failed err: %d", err);
+			goto error;
+		}
+		data->codec_configured =  NON_A2DP_CODEC_BTAPTX;
+	} else
+#endif //ENABLE_CSR_APTX_CODEC
+
+	if ( (data->codec_supported_remote & (1 << BT_A2DP_SBC_SINK)) != 0) {
+		DBG("sbc codec found : calling bluetooth_a2dp_hw_params");
+		DBG(" data->codec_priority = %d",data->codec_priority);
+		data->codec_configured = A2DP_CODEC_SBC;
+		err = bluetooth_a2dp_hw_params(data);
+		if (err < 0) {
+			ERR("bluetooth_a2dp_sbc_hw_params failed err: %d", err);
+			goto error;
+		}
+	} else {
+		ERR("bluetooth_configure SBC is not supported");
 		goto error;
 	}
 
@@ -1020,12 +1245,26 @@ again:
 	return -err;
 }
 
+#ifdef ENABLE_CSR_APTX_CODEC
+void aptx_finish(struct bluetooth_data *data)
+{
+	memset(&data->btaptx, 0 , sizeof(data->btaptx));
+	if(data->aptxCodec!=NULL) {
+		free(data->aptxCodec);
+		data->aptxCodec=NULL;
+	}
+}
+#endif // ENABLE_CSR_APTX_CODEC
+
 static void a2dp_free(struct bluetooth_data *data)
 {
 	pthread_cond_destroy(&data->client_wait);
 	pthread_cond_destroy(&data->thread_wait);
 	pthread_cond_destroy(&data->thread_start);
 	pthread_mutex_destroy(&data->mutex);
+#ifdef ENABLE_CSR_APTX_CODEC
+	aptx_finish(data);
+#endif //ENABLE_CSR_APTX_CODEC
 	free(data);
 	return;
 }
@@ -1084,7 +1323,6 @@ static void* a2dp_thread(void *d)
 			case A2DP_CMD_QUIT:
 				bluetooth_close(data);
 				sbc_finish(&data->sbc);
-				a2dp_free(data);
 				goto done;
 
 			case A2DP_CMD_INIT:
@@ -1092,8 +1330,8 @@ static void* a2dp_thread(void *d)
 			default:
 				break;
 		}
-		// reset last command in case of error to allow
-		// re-execution of the same command
+		/* reset last command in case of error to allow
+		 re-execution of the same command */
 		if (err < 0) {
 			command = A2DP_CMD_NONE;
 		}
@@ -1101,6 +1339,7 @@ static void* a2dp_thread(void *d)
 
 done:
 	pthread_mutex_unlock(&data->mutex);
+	a2dp_free(data);
 	DBG("a2dp_thread finished");
 	return NULL;
 }
@@ -1122,10 +1361,16 @@ int a2dp_init(int rate, int channels, a2dpData* dataPtr)
 	data->stream.fd = -1;
 	data->state = A2DP_STATE_NONE;
 	data->command = A2DP_CMD_NONE;
+	data->stream_suspended = 0;
 
 	strncpy(data->address, "00:00:00:00:00:00", 18);
 	data->rate = rate;
 	data->channels = channels;
+
+#ifdef ENABLE_CSR_APTX_CODEC
+	data->aptxCodec = malloc((size_t)SizeofAptxbtenc());
+	aptxbtenc_init(data->aptxCodec, 0); //check what is best 0 or 1? for aptX init
+#endif
 
 	sbc_init(&data->sbc, 0);
 
@@ -1179,6 +1424,98 @@ void a2dp_set_sink(a2dpData d, const char* address)
 	}
 }
 
+void a2dp_set_cp_header(a2dpData d, uint8_t cpHeader)
+{
+	struct bluetooth_data* data = (struct bluetooth_data*)d;
+
+	if (data) {
+		VDBG("a2dp_set_cp_header called.  current: %x, new: %x", data->scms_t_cp_header, cpHeader);
+
+		/* For SCMS-T least significant two bits matter, mask out the rest */
+		data->scms_t_cp_header = (cpHeader & 0x03);
+	}
+}
+
+#ifdef ENABLE_CSR_APTX_CODEC
+static int avdtp_write_btaptx(struct bluetooth_data *data)
+{
+	int ret = 0;
+	uint64_t now;
+	long duration = (10000*4 * data->frame_count) / 441;  // delayed the division by 441
+#ifdef ENABLE_TIMING
+	uint64_t begin, end, begin2, end2;
+	begin = get_microseconds();
+#endif
+	data->stream.revents = 0;
+#ifdef ENABLE_TIMING
+	begin2 = get_microseconds();
+#endif
+	ret = poll(&data->stream, 1, POLL_TIMEOUT);
+#ifdef ENABLE_TIMING
+	end2 = get_microseconds();
+	print_time("poll", begin2, end2);
+#endif
+	if (ret == 1 && data->stream.revents == POLLOUT) {
+		long ahead = 0;
+		now = get_microseconds();
+
+		if (data->next_write) {
+			ahead = data->next_write - now;
+#ifdef ENABLE_TIMING
+			DBG("duration: %ld, ahead: %ld", duration, ahead);
+#endif
+			if (ahead > 0) {
+				/* too fast, need to throttle */
+				usleep(ahead);
+			}
+		} else {
+			data->next_write = now;
+		}
+		if (ahead <= -CATCH_UP_TIMEOUT * 1000) {
+			/* fallen too far behind, don't try to catch up */
+			VDBG("ahead < %d, reseting next_write timestamp", -CATCH_UP_TIMEOUT * 1000);
+			data->next_write = 0;
+		} else {
+			data->next_write += duration;
+		}
+
+#ifdef ENABLE_TIMING
+		begin2 = get_microseconds();
+#endif
+		ret = send(data->stream.fd, data->buffer, data->count, MSG_NOSIGNAL);
+
+#ifdef ENABLE_TIMING
+		end2 = get_microseconds();
+		print_time("send", begin2, end2);
+#endif
+		if (ret < 0) {
+			/* can happen during normal remote disconnect */
+			VDBG("send() failed: %d (errno %s)", ret, strerror(errno));
+		}
+		if (ret == -EPIPE) {
+			bluetooth_close(data);
+		}
+	} else {
+		 /* can happen during normal remote disconnect */
+		VDBG("poll() failed: %d (revents = %d, errno %s)",
+				ret, data->stream.revents, strerror(errno));
+		data->next_write = 0;
+	}
+
+	/* Reset buffer of data to send */
+	data->count = 0; // btaptx has no header....
+	data->frame_count = 0;
+	data->samples = 0;
+	data->seq_num++;
+#ifdef ENABLE_TIMING
+	end = get_microseconds();
+	print_time("avdtp_write", begin, end);
+#endif
+	return 0; /* always return success */
+}
+
+#endif //ENABLE_CSR_APTX_CODEC
+
 int a2dp_write(a2dpData d, const void* buffer, int count)
 {
 	struct bluetooth_data* data = (struct bluetooth_data*)d;
@@ -1190,6 +1527,16 @@ int a2dp_write(a2dpData d, const void* buffer, int count)
 	unsigned int written;
 	const char *buff;
 	int did_configure = 0;
+
+#ifdef ENABLE_CSR_APTX_CODEC
+	uint16_t* srcptr = (uint16_t *)buffer;
+	uint32_t pcmL[4];
+	uint32_t pcmR[4];
+	uint16_t encodedSample[2];
+	uint8_t t;
+#endif //ENABLE_CSR_APTX_CODEC
+
+
 #ifdef ENABLE_TIMING
 	uint64_t begin, end;
 	DBG("********** a2dp_write **********");
@@ -1202,38 +1549,95 @@ int a2dp_write(a2dpData d, const void* buffer, int count)
 
 	codesize = data->codesize;
 
-	while (frames_left >= codesize) {
-		/* Enough data to encode (sbc wants 512 byte blocks) */
-		encoded = sbc_encode(&(data->sbc), src, codesize,
+	VDBG("data->codec_configured = %d ",data->codec_configured);
+
+#ifdef ENABLE_CSR_APTX_CODEC
+	if (data->codec_configured == NON_A2DP_CODEC_BTAPTX) {
+		codesize = 16;
+		written = 4;
+		encoded = 8;
+		DBG("aptx encoding");
+		while (frames_left >= codesize) {
+			// get the next 4 PCM samples per channel from the buffer
+			for (t = 0; t < 4; t++) {
+				pcmL[t] = (uint32_t*)(srcptr[2*t]);
+				pcmR[t] = (uint32_t*)(srcptr[2*t+1]);
+			}
+
+			aptxbtenc_encodestereo(data->aptxCodec, pcmL, pcmR,  &encodedSample);
+
+			data->buffer[data->count]   = (uint8_t)((encodedSample[0] >>8) & 0xff);
+			data->buffer[data->count+1] = (uint8_t)((encodedSample[0] >>0) & 0xff);
+			data->buffer[data->count+2] = (uint8_t)((encodedSample[1] >>8) & 0xff);
+			data->buffer[data->count+3] = (uint8_t)((encodedSample[1] >>0) & 0xff);
+
+			srcptr += encoded;
+			data->count += written;
+			data->frame_count++;
+			data->samples += encoded;
+			data->nsamples += encoded;
+
+			/* No space left for another frame then send
+			using max of mtu approx 892 of data->link_mtu (approx 895)
+			*/
+
+			if ((data->count + 4 >= data->link_mtu) || (data->count + 4 >= 370) ||
+				(data->count + 4 >= BUFFER_SIZE)) {
+
+				DBG("from btaptx sending packet %d, data->samples=%d, count %d, link_mtu %u",
+					data->seq_num, data->samples, data->count,
+					data->link_mtu);
+
+				err = avdtp_write_btaptx(data);
+				if (err < 0)
+					return err;
+			}
+
+			ret += codesize;
+			frames_left -= codesize;
+
+		}
+	//end btaptx
+	} else
+#endif
+
+	if (data->codec_configured == A2DP_CODEC_SBC) {
+		VDBG("SBC encoding");
+
+		while (frames_left >= codesize) {
+			/* Enough data to encode (sbc wants 512 byte blocks) */
+			encoded = sbc_encode(&(data->sbc), src, codesize,
 					data->buffer + data->count,
 					sizeof(data->buffer) - data->count,
 					&written);
-		if (encoded <= 0) {
-			ERR("Encoding error %d", encoded);
-			goto done;
-		}
-		VDBG("sbc_encode returned %d, codesize: %d, written: %d\n",
-			encoded, codesize, written);
+			if (encoded <= 0) {
+				ERR("Encoding error %d", encoded);
+				goto done;
+			}
+			VDBG("sbc_encode returned %d, codesize: %d, written: %d\n",
+							encoded, codesize, written);
 
-		src += encoded;
-		data->count += written;
-		data->frame_count++;
-		data->samples += encoded;
-		data->nsamples += encoded;
-
-		/* No space left for another frame then send */
-		if ((data->count + written >= data->link_mtu) ||
+			src += encoded;
+			data->count += written;
+			data->frame_count++;
+			data->samples += encoded;
+			data->nsamples += encoded;
+			/* No space left for another frame then send */
+			if ((data->count + written >= data->link_mtu) ||
 				(data->count + written >= BUFFER_SIZE)) {
-			VDBG("sending packet %d, count %d, link_mtu %u",
-					data->seq_num, data->count,
-					data->link_mtu);
-			err = avdtp_write(data);
-			if (err < 0)
-				return err;
-		}
+				VDBG("sending packet %d, count %d, link_mtu %u",
+						data->seq_num, data->count,
+								data->link_mtu);
+				err = avdtp_write(data);
+				if (err < 0)
+					return err;
+			}
 
-		ret += encoded;
-		frames_left -= encoded;
+			ret += encoded;
+			frames_left -= encoded;
+		}
+	} else {
+		ERR("No suported codec encoder\n");
 	}
 
 	if (frames_left > 0)
@@ -1253,6 +1657,7 @@ int a2dp_stop(a2dpData d)
 	DBG("a2dp_stop\n");
 	if (!data)
 		return 0;
+	data->stream_suspended = 0;
 
 	set_command(data, A2DP_CMD_STOP);
 	return 0;
@@ -1262,5 +1667,243 @@ void a2dp_cleanup(a2dpData d)
 {
 	struct bluetooth_data* data = (struct bluetooth_data*)d;
 	DBG("a2dp_cleanup\n");
+	data->stream_suspended = 0;
 	set_command(data, A2DP_CMD_QUIT);
 }
+
+#ifdef ENABLE_CSR_APTX_CODEC
+
+/* bluetooth_a2dp_btaptx_init(struct bluetooth_data *data) function for btaptx to initialized
+ * NOTE:  In this function we are not checking for vender and codec ids here as while
+ * initialization we set  frequency and mode only for btaptx 17.01.2011. */
+
+
+static int bluetooth_a2dp_btaptx_init(struct bluetooth_data *data)
+{
+	btaptx_capabilities_t *cap = &data->btaptx_capabilities;
+	int dir;
+
+	DBG("We are in bluetooth_a2dp_btaptx_init()\n");
+
+	switch (data->rate) {
+		case 48000:
+		cap->frequency = BT_BTAPTX_SAMPLING_FREQ_48000;
+		break;
+		case 44100:
+		cap->frequency = BT_BTAPTX_SAMPLING_FREQ_44100;
+		break;
+		case 32000:
+		cap->frequency = BT_BTAPTX_SAMPLING_FREQ_32000;
+		break;
+		case 16000:
+		cap->frequency = BT_BTAPTX_SAMPLING_FREQ_16000;
+		break;
+		default:
+		ERR("Rate %d not supported", data->rate);
+		return -1;
+	}
+	/*
+	 * aptX only supports STEREO mode, so no need to set for other channel modes
+         * like SBC, but need to check them.
+	 */
+	if (data->channels == 2) {
+		if (cap->channel_mode & BT_A2DP_CHANNEL_MODE_JOINT_STEREO)
+		cap->channel_mode = BT_A2DP_CHANNEL_MODE_STEREO;
+		else if (cap->channel_mode & BT_A2DP_CHANNEL_MODE_STEREO)
+		cap->channel_mode = BT_A2DP_CHANNEL_MODE_STEREO;
+		else if (cap->channel_mode & BT_A2DP_CHANNEL_MODE_DUAL_CHANNEL)
+		cap->channel_mode = BT_A2DP_CHANNEL_MODE_STEREO;
+	}
+	else
+	{
+		ERR("No supported channel modes");
+		return -1;
+	}
+	if (!cap->channel_mode) {
+		ERR("No supported channel modes");
+		return -1;
+	}
+	return 0;
+}
+/*
+        bluetooth_a2dp_btaptx_setup(struct bluetooth_data *data)
+
+*/
+
+static void bluetooth_a2dp_btaptx_setup(struct bluetooth_data *data)
+{
+	btaptx_capabilities_t active_capabilities = data->btaptx_capabilities;
+
+	DBG("We are in bluetooth_a2dp_btaptx_setup()\n");
+
+	if (active_capabilities.frequency & BT_BTAPTX_SAMPLING_FREQ_16000)
+		data->btaptx.frequency = BT_BTAPTX_SAMPLING_FREQ_16000;
+
+	if (active_capabilities.frequency & BT_BTAPTX_SAMPLING_FREQ_32000)
+		data->btaptx.frequency = BT_BTAPTX_SAMPLING_FREQ_32000;
+
+	if (active_capabilities.frequency & BT_BTAPTX_SAMPLING_FREQ_44100)
+		data->btaptx.frequency = BT_BTAPTX_SAMPLING_FREQ_44100;
+
+	if (active_capabilities.frequency & BT_BTAPTX_SAMPLING_FREQ_48000)
+		data->btaptx.frequency = BT_BTAPTX_SAMPLING_FREQ_48000;
+
+	if (active_capabilities.channel_mode == 2) {
+		if (active_capabilities.channel_mode & BT_A2DP_CHANNEL_MODE_JOINT_STEREO)
+			data->btaptx.mode = BT_A2DP_CHANNEL_MODE_STEREO;
+		else if (active_capabilities.channel_mode & BT_A2DP_CHANNEL_MODE_STEREO)
+			data->btaptx.mode = BT_A2DP_CHANNEL_MODE_STEREO;
+		else if (active_capabilities.channel_mode & BT_A2DP_CHANNEL_MODE_DUAL_CHANNEL)
+			data->btaptx.mode = BT_A2DP_CHANNEL_MODE_STEREO;
+	}
+	else
+	{
+		ERR("No supported channel modes");
+	}
+
+	DBG("End of bluetooth_a2dp_btaptx_setup()\n");
+}
+
+/*
+
+bluetooth_a2dp_btaptx_hw_params(struct bluetooth_data *data)
+
+
+*/
+static int bluetooth_a2dp_btaptx_hw_params(struct bluetooth_data *data)
+{
+	char buf[BT_SUGGESTED_BUFFER_SIZE];
+	struct bt_open_req *open_req = (void *) buf;
+	struct bt_open_rsp *open_rsp = (void *) buf;
+	struct bt_set_configuration_req *setconf_req = (void*) buf;
+	struct bt_set_configuration_rsp *setconf_rsp = (void*) buf;
+	int err;
+
+	DBG("We are in bluetooth_a2dp_btaptx_hw_params()\n");
+
+	memset(open_req, 0, BT_SUGGESTED_BUFFER_SIZE);
+	open_req->h.type = BT_REQUEST;
+	open_req->h.name = BT_OPEN;
+	open_req->h.length = sizeof(*open_req);
+	strncpy(open_req->destination, data->address, 18);
+
+	open_req->seid = data->btaptx_capabilities.capability.seid;
+	open_req->lock = BT_WRITE_LOCK;
+
+	DBG("open_req->h.type = BT_REQUEST=%s\n", bt_audio_strname(open_req->h.type));
+	DBG("open_req->h.name = BT_OPEN=%s\n", bt_audio_strname(open_req->h.name));
+	DBG("open_req->h.length = sizeof(*open_req)=%u\n",open_req->h.length);
+
+	DBG("strncpy(open_req->destination, data->address,18=%H\n",open_req->destination);
+	DBG("open_req->seid = data->btaptx.capability.seid=%u\n", open_req->seid);
+	DBG("open_req->lock = BT_WRITE_LOCK=%u\n", open_req->lock);
+
+	err = audioservice_send(data, &open_req->h);
+	if (err < 0)
+		return err;
+
+	open_rsp->h.length = sizeof(*open_rsp);
+	err = audioservice_expect(data, &open_rsp->h, BT_OPEN);
+	if (err < 0)
+		return err;
+
+	err = bluetooth_a2dp_btaptx_init(data);
+	if (err < 0)
+		return err;
+	memset(setconf_req, 0, BT_SUGGESTED_BUFFER_SIZE);
+	setconf_req->h.type = BT_REQUEST;
+	setconf_req->h.name = BT_SET_CONFIGURATION;
+	setconf_req->h.length = sizeof(*setconf_req);
+
+	memcpy(&setconf_req->codec, &data->btaptx_capabilities,
+		sizeof(btaptx_capabilities_t));
+
+	setconf_req->codec.transport = BT_CAPABILITIES_TRANSPORT_A2DP;
+	setconf_req->codec.length = sizeof(data->btaptx_capabilities);
+	setconf_req->h.length += setconf_req->codec.length - sizeof(setconf_req->codec);
+
+
+	DBG("setconf_req->h.type = BT_REQUEST=%s\n", bt_audio_strname(setconf_req->h.type));
+	DBG("setconf_req->h.name = BT_SET_CONFIGURATION=%s\n", bt_audio_strname(setconf_req->h.name));
+	DBG("setconf_req->h.length = sizeof(*open_req)=%u\n",setconf_req->h.length);
+	DBG("setconf_req->codec.transport=%u\n",setconf_req->codec.transport);
+	DBG("setconf_req->codec.length=%u\n", setconf_req->codec.length);
+	DBG("setconf_req->h.length += setconf_req->codec.length  - sizeof(setconf_req->codec) (%u %u %u) \n",
+		setconf_req->h.length, setconf_req->codec.length, sizeof(setconf_req->codec));
+
+	DBG("bluetooth_a2dp_btaptx_hw_params sending configuration and DBG starts\n");
+
+	DBG("bluetooth_a2dp_btaptx_hw_params sending configuration:\n");
+
+#ifdef DEBUG
+	switch (data->btaptx_capabilities.channel_mode) {
+		case BT_A2DP_CHANNEL_MODE_MONO:
+			DBG("\tchannel_mode: MONO\n");
+			break;
+		case BT_A2DP_CHANNEL_MODE_DUAL_CHANNEL:
+			DBG("\tchannel_mode: DUAL CHANNEL\n");
+			break;
+		case BT_A2DP_CHANNEL_MODE_STEREO:
+			DBG("\tchannel_mode: STEREO\n");
+			break;
+		case BT_A2DP_CHANNEL_MODE_JOINT_STEREO:
+			DBG("\tchannel_mode: JOINT STEREO\n");
+			break;
+		default:
+			DBG("\tchannel_mode: UNKNOWN (%d)\n",
+				data->btaptx_capabilities.channel_mode);
+	}
+	switch (data->btaptx_capabilities.frequency) {
+		case BT_BTAPTX_SAMPLING_FREQ_16000:
+			DBG("\tfrequency: 16000\n");
+			break;
+		case BT_BTAPTX_SAMPLING_FREQ_32000:
+			DBG("\tfrequency: 32000\n");
+			break;
+		case BT_BTAPTX_SAMPLING_FREQ_44100:
+			DBG("\tfrequency: 44100\n");
+			break;
+		case BT_BTAPTX_SAMPLING_FREQ_48000:
+			DBG("\tfrequency: 48000\n");
+			break;
+		default:
+			DBG("\tfrequency: UNKNOWN (%d)\n",
+				data->btaptx_capabilities.frequency);
+	}
+
+	DBG("aptx codec ID0 = %u\n ",  data->btaptx_capabilities.codec_id0);
+	DBG("aptx codec ID1 = %u\n ",  data->btaptx_capabilities.codec_id1);
+	DBG("aptx Vendor ID0 = %u\n ", data->btaptx_capabilities.vender_id0);
+	DBG("aptx Vendor ID1 = %u\n ", data->btaptx_capabilities.vender_id1);
+	DBG("aptx Vendor ID2 = %u\n ", data->btaptx_capabilities.vender_id2);
+	DBG("aptx Vendor ID3 = %u\n ", data->btaptx_capabilities.vender_id3);
+#endif //DEBUG
+	err = audioservice_send(data, &setconf_req->h);
+
+	DBG("bluetooth_a2dp_btaptx_hw_params called audioservice_send() from \n");
+
+	if (err < 0)
+		return err;
+
+	err = audioservice_expect(data, &setconf_rsp->h, BT_SET_CONFIGURATION);
+	DBG("bluetooth_a2dp_hw_btaptx_params called audioservice_expect()\n");
+	if (err < 0)
+		return err;
+
+	data->link_mtu = setconf_rsp->link_mtu;
+	DBG("MTU: %d", data->link_mtu);
+
+	/* Setup BTAPTX encoder now we agree on parameters */
+
+	DBG("bluetooth_a2dp_btaptx_hw_params called bluetooth_a2dp_btaptx_setup(data)\n");
+
+	bluetooth_a2dp_btaptx_setup(data);
+
+	DBG("end of bluetooth_a2dp_btaptx_hw_btaptx_params()\n");
+
+	return 0;
+}
+#endif //ENABLE_CSR_APTX_CODEC
+
+
+

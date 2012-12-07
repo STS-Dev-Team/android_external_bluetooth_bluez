@@ -3,6 +3,7 @@
  *  BlueZ - Bluetooth protocol stack for Linux
  *
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -52,6 +53,7 @@
 #include "manager.h"
 #include "oob.h"
 #include "eir.h"
+#include "agent.h"
 
 #define DISCOV_HALTED 0
 #define DISCOV_INQ 1
@@ -155,6 +157,13 @@ static struct dev_info {
 	guint stop_scan_id;
 } *devs = NULL;
 
+struct oob_availability_req {
+	bdaddr_t bdaddr;
+	uint8_t auth;
+	uint8_t capa;
+	int index;
+};
+
 static inline int get_state(int index)
 {
 	struct dev_info *dev = &devs[index];
@@ -232,7 +241,7 @@ static int get_adapter_type(int index)
 
 static int ignore_device(struct hci_dev_info *di)
 {
-	return hci_test_bit(HCI_RAW, &di->flags) || di->type >> 4 != HCI_BREDR;
+	return hci_test_bit(HCI_RAW, &di->flags) || !is_bredr_hci_device_type(di->type);
 }
 
 static struct dev_info *init_dev_info(int index, int sk, gboolean registered,
@@ -867,13 +876,39 @@ static int get_auth_info(int index, bdaddr_t *bdaddr, uint8_t *auth)
 static void link_key_request(int index, bdaddr_t *dba)
 {
 	struct dev_info *dev = &devs[index];
+	struct btd_adapter *adapter;
+	struct btd_device *device;
 	struct link_key_info *key_info;
 	struct bt_conn *conn;
 	GSList *match;
+	int dd, err;
+	uint8_t pending_sec_level = 0, ssp_mode = 0;
+	uint32_t class;
+	struct hci_conn_info_req *cr;
 	char da[18];
 
 	ba2str(dba, da);
 	DBG("hci%d dba %s", index, da);
+
+	dd = hci_open_dev(index);
+	if (dd < 0)
+		return;
+
+	cr = g_malloc0(sizeof(*cr) + sizeof(struct hci_conn_info));
+	cr->type = ACL_LINK;
+	bacpy(&cr->bdaddr, dba);
+
+	err = ioctl(dd, HCIGETCONNINFO, cr);
+
+	if (err < 0) {
+		return;
+	}
+
+	pending_sec_level = cr->conn_info->pending_sec_level;
+	ssp_mode = cr->conn_info->ssp_mode;
+	g_free(cr);
+	DBG("Pending Security level is %d", (int)pending_sec_level);
+	DBG("Ssp mode is %d", (int)ssp_mode);
 
 	conn = get_connection(dev, dba);
 	if (conn->handle == 0)
@@ -893,6 +928,17 @@ static void link_key_request(int index, bdaddr_t *dba)
 
 	if (key_info == NULL || (!dev->debug_keys && key_info->type == 0x03)) {
 		/* Link key not found */
+		hci_send_cmd(dev->sk, OGF_LINK_CTL, OCF_LINK_KEY_NEG_REPLY,
+								6, dba);
+		return;
+	}
+
+	DBG("Type %d pending sec is %d pin lne %d", key_info->type, pending_sec_level,
+						key_info->pin_len);
+
+	if ((ssp_mode == 0) && (pending_sec_level == BT_SECURITY_HIGH) &&
+				(key_info->pin_len != 16)) {
+		DBG("Matching key not found");
 		hci_send_cmd(dev->sk, OGF_LINK_CTL, OCF_LINK_KEY_NEG_REPLY,
 								6, dba);
 		return;
@@ -1000,7 +1046,7 @@ static void link_key_notify(int index, void *ptr)
 
 		err = btd_event_link_key_notify(&dev->bdaddr, dba,
 						evt->link_key, key_type,
-						dev->pin_length);
+						dev->pin_length, 0, 0, NULL);
 
 		if (err == -ENODEV)
 			status = HCI_OE_LOW_RESOURCES;
@@ -1008,6 +1054,9 @@ static void link_key_notify(int index, void *ptr)
 			status = HCI_MEMORY_FULL;
 
 		goto done;
+	} else {
+		DBG("link key is not stored, setting device as temporary");
+		btd_event_device_set_temporary(&dev->bdaddr, dba);
 	}
 
 done:
@@ -1202,9 +1251,46 @@ static void remote_oob_data_request(int index, bdaddr_t *bdaddr)
 				REMOTE_OOB_DATA_REPLY_CP_SIZE, &cp);
 
 	} else {
-		hci_send_cmd(dev->sk, OGF_LINK_CTL,
+		if (hcid_dbus_get_oob_data(&dev->bdaddr, bdaddr) < 0) {
+			DBG("Error while requesting OOB data");
+			hci_send_cmd(dev->sk, OGF_LINK_CTL,
 				OCF_REMOTE_OOB_DATA_NEG_REPLY, 6, bdaddr);
+		}
 	}
+}
+
+static int set_auth_requirements(bdaddr_t *local, bdaddr_t *remote,
+							uint8_t *auth)
+{
+	struct hci_auth_info_req req;
+	char addr[18];
+	int err, dd, dev_id;
+
+	ba2str(local, addr);
+
+	dev_id = hci_devid(addr);
+	if (dev_id < 0)
+		return dev_id;
+
+	dd = hci_open_dev(dev_id);
+	if (dd < 0)
+		return dd;
+
+	memset(&req, 0, sizeof(req));
+	bacpy(&req.bdaddr, remote);
+	req.type = *auth;
+
+	err = ioctl(dd, HCISETAUTHINFO, (unsigned long) &req);
+	if (err < 0) {
+		DBG("HCISETAUTHINFO failed: %s (%d)",
+					strerror(errno), errno);
+		hci_close_dev(dd);
+		return err;
+	}
+
+	hci_close_dev(dd);
+
+	return 0;
 }
 
 static int get_io_cap(int index, bdaddr_t *bdaddr, uint8_t *cap, uint8_t *auth)
@@ -1265,6 +1351,11 @@ static int get_io_cap(int index, bdaddr_t *bdaddr, uint8_t *cap, uint8_t *auth)
 		if (conn->rem_auth != 0xff && (conn->rem_auth & 0x01) &&
 							conn->loc_cap != 0x03)
 			conn->loc_auth |= 0x01;
+
+		/* Update the modified authorization level in the
+		 * kernel space. */
+		set_auth_requirements(&dev->bdaddr, bdaddr, auth);
+
 	}
 
 done:
@@ -1274,6 +1365,30 @@ done:
 	DBG("final authentication requirement is 0x%02x", *auth);
 
 	return 0;
+}
+
+static void oob_availability_cb(struct agent *agent, DBusError *err,
+                                        void *user_data)
+{
+	struct oob_availability_req *oob = user_data;
+	struct dev_info *dev = &devs[oob->index];
+	io_capability_reply_cp cp;
+	memset(&cp, 0, sizeof(cp));
+	bacpy(&cp.bdaddr, &oob->bdaddr);
+	cp.capability = oob->capa;
+	cp.authentication = oob->auth;
+	DBG(" ");
+	if (err) {
+		DBG("OOB data does not present for remote device");
+		cp.oob_data = 0x00;
+		hci_send_cmd(dev->sk, OGF_LINK_CTL, OCF_IO_CAPABILITY_REPLY,
+					IO_CAPABILITY_REPLY_CP_SIZE, &cp);
+	} else {
+		DBG("OOB data present for remote device");
+		cp.oob_data = 0x01;
+		hci_send_cmd(dev->sk, OGF_LINK_CTL, OCF_IO_CAPABILITY_REPLY,
+					IO_CAPABILITY_REPLY_CP_SIZE, &cp);
+	}
 }
 
 static void io_capa_request(int index, void *ptr)
@@ -1316,9 +1431,42 @@ static void io_capa_request(int index, void *ptr)
 		if ((conn->bonding_initiator || conn->rem_oob_data == 0x01) &&
 				match)
 			cp.oob_data = 0x01;
-		else
-			cp.oob_data = 0x00;
+		else {
+			DBG("OOB data, querying the frameworks");
+			struct btd_adapter *adapter =
+					manager_find_adapter_by_id(index);
+			struct btd_device *device =
+					adapter_find_device(adapter, da);
+			struct oob_availability_req *oob_req;
+			struct agent *agent = device_get_agent(device);
+			int ret;
+			gboolean oob = agent_get_oob_capability(agent);
+			DBG("agent's oob capability is %d", oob);
 
+			// if pairing is not locally initiated
+			if (oob) {
+				oob_req =
+					g_new0(struct oob_availability_req, 1);
+				bdaddr_t bdaddr;
+				device_get_address(device, &bdaddr, NULL);
+				bacpy(&oob_req->bdaddr, &bdaddr);
+				oob_req->auth = auth;
+				oob_req->capa = cap;
+				oob_req->index = index;
+				DBG("Requesting for oob availability");
+				ret = device_request_oob_availability(device,
+							oob_availability_cb,
+                                                        oob_req);
+				if (ret < 0) {
+					DBG("error reading oob availability");
+					g_free(oob_req);
+					cp.oob_data = 0x00;
+					goto done;
+				}
+				return;
+			}
+		}
+done:
 		hci_send_cmd(dev->sk, OGF_LINK_CTL, OCF_IO_CAPABILITY_REPLY,
 					IO_CAPABILITY_REPLY_CP_SIZE, &cp);
 	}
@@ -1330,6 +1478,7 @@ static void io_capa_response(int index, void *ptr)
 	evt_io_capability_response *evt = ptr;
 	struct bt_conn *conn;
 	char da[18];
+	uint8_t local_auth;
 
 	ba2str(&evt->bdaddr, da);
 	DBG("hci%d IO capability response from %s", index, da);
@@ -1339,6 +1488,16 @@ static void io_capa_response(int index, void *ptr)
 		conn->rem_cap = evt->capability;
 		conn->rem_auth = evt->authentication;
 		conn->rem_oob_data = evt->oob_data;
+		if (!(conn->rem_auth & 0x01)) {
+			DBG("Remote auth is %d", conn->rem_auth);
+			get_auth_info(index, &evt->bdaddr, &local_auth);
+			DBG("local auth req is %d", local_auth);
+			local_auth = local_auth & 0xfe;
+			DBG("Writing local auth as %d", local_auth);
+			set_auth_requirements(&dev->bdaddr, &evt->bdaddr, &local_auth);
+			get_auth_info(index, &evt->bdaddr, &local_auth);
+			DBG("local auth req is %d", local_auth);
+		}
 	}
 }
 
@@ -1920,8 +2079,8 @@ static inline void inquiry_result(int index, int plen, void *ptr)
 						(info->dev_class[1] << 8) |
 						(info->dev_class[2] << 16);
 
-		btd_event_device_found(&dev->bdaddr, &info->bdaddr, class,
-								0, NULL);
+		btd_event_device_found(&dev->bdaddr, &info->bdaddr,
+					ADDR_TYPE_BREDR, 0, 0, class, 0, NULL);
 		ptr += INQUIRY_INFO_SIZE;
 	}
 }
@@ -1943,7 +2102,8 @@ static inline void inquiry_result_with_rssi(int index, int plen, void *ptr)
 						| (info->dev_class[2] << 16);
 
 			btd_event_device_found(&dev->bdaddr, &info->bdaddr,
-						class, info->rssi, NULL);
+						ADDR_TYPE_BREDR, 0, 0, class,
+						info->rssi, NULL);
 			ptr += INQUIRY_INFO_WITH_RSSI_AND_PSCAN_MODE_SIZE;
 		}
 	} else {
@@ -1954,7 +2114,8 @@ static inline void inquiry_result_with_rssi(int index, int plen, void *ptr)
 						| (info->dev_class[2] << 16);
 
 			btd_event_device_found(&dev->bdaddr, &info->bdaddr,
-						class, info->rssi, NULL);
+						ADDR_TYPE_BREDR, 0, 0, class,
+						info->rssi, NULL);
 			ptr += INQUIRY_INFO_WITH_RSSI_SIZE;
 		}
 	}
@@ -1972,8 +2133,9 @@ static inline void extended_inquiry_result(int index, int plen, void *ptr)
 					| (info->dev_class[1] << 8)
 					| (info->dev_class[2] << 16);
 
-		btd_event_device_found(&dev->bdaddr, &info->bdaddr, class,
-						info->rssi, info->data);
+		btd_event_device_found(&dev->bdaddr, &info->bdaddr,
+					ADDR_TYPE_BREDR, 0, 0, class,
+					info->rssi, info->data);
 		ptr += EXTENDED_INQUIRY_INFO_SIZE;
 	}
 }
@@ -2079,7 +2241,7 @@ static inline void conn_complete(int index, void *ptr)
 	conn = get_connection(dev, &evt->bdaddr);
 	conn->handle = btohs(evt->handle);
 
-	btd_event_conn_complete(&dev->bdaddr, &evt->bdaddr);
+	btd_event_conn_complete(&dev->bdaddr, &evt->bdaddr, FALSE);
 
 	if (conn->secmode3)
 		bonding_complete(dev, conn, 0);
@@ -2115,7 +2277,7 @@ static inline void le_conn_complete(int index, void *ptr)
 	conn = get_connection(dev, &evt->peer_bdaddr);
 	conn->handle = btohs(evt->handle);
 
-	btd_event_conn_complete(&dev->bdaddr, &evt->peer_bdaddr);
+	btd_event_conn_complete(&dev->bdaddr, &evt->peer_bdaddr, FALSE);
 
 	/* check if the remote version needs be requested */
 	ba2str(&dev->bdaddr, local_addr);
@@ -2189,6 +2351,17 @@ static inline void conn_request(int index, void *ptr)
 	btd_event_remote_class(&dev->bdaddr, &evt->bdaddr, class);
 }
 
+static inline addr_type_t le_addr_type(uint8_t bdaddr_type)
+{
+	switch (bdaddr_type) {
+	case LE_RANDOM_ADDRESS:
+		return ADDR_TYPE_LE_RANDOM;
+	case LE_PUBLIC_ADDRESS:
+	default:
+		return ADDR_TYPE_LE_PUBLIC;
+	}
+}
+
 static inline void le_advertising_report(int index, evt_le_meta_event *meta)
 {
 	struct dev_info *dev = &devs[index];
@@ -2204,7 +2377,8 @@ static inline void le_advertising_report(int index, evt_le_meta_event *meta)
 	memset(eir, 0, sizeof(eir));
 	memcpy(eir, info->data, info->length);
 
-	btd_event_device_found(&dev->bdaddr, &info->bdaddr, 0, rssi, eir);
+	btd_event_device_found(&dev->bdaddr, &info->bdaddr,
+				le_addr_type(info->bdaddr_type), 0, rssi, eir);
 
 	num_reports--;
 
@@ -2216,8 +2390,9 @@ static inline void le_advertising_report(int index, evt_le_meta_event *meta)
 		memset(eir, 0, sizeof(eir));
 		memcpy(eir, info->data, info->length);
 
-		btd_event_device_found(&dev->bdaddr, &info->bdaddr, 0, rssi,
-									eir);
+		btd_event_device_found(&dev->bdaddr, &info->bdaddr,
+					le_addr_type(info->bdaddr_type),
+					0, rssi, eir);
 	}
 }
 
@@ -3558,8 +3733,11 @@ static int hciops_create_bonding(int index, bdaddr_t *bdaddr, uint8_t io_cap)
 {
 	struct dev_info *dev = &devs[index];
 	BtIOSecLevel sec_level;
+	gboolean is_ssp_cap = FALSE;
 	struct bt_conn *conn;
 	GError *err = NULL;
+
+	DBG("hci%d io_cap 0x%02x", index, io_cap);
 
 	conn = get_connection(dev, bdaddr);
 
@@ -3568,13 +3746,25 @@ static int hciops_create_bonding(int index, bdaddr_t *bdaddr, uint8_t io_cap)
 
 	conn->loc_cap = io_cap;
 
+	int err_eir = read_remote_eir(&dev->bdaddr, bdaddr, NULL);
+	DBG("Err is %d", err_eir);
+
+	if (err_eir != -ENOENT)
+		is_ssp_cap = TRUE;
+
+
 	/* If our IO capability is NoInputNoOutput use medium security
 	 * level (i.e. don't require MITM protection) else use high
 	 * security level */
-	if (io_cap == 0x03)
+	if (is_ssp_cap == FALSE)
 		sec_level = BT_IO_SEC_MEDIUM;
-	else
-		sec_level = BT_IO_SEC_HIGH;
+	else {
+		if (io_cap == 0x03)
+			sec_level = BT_IO_SEC_MEDIUM;
+		else
+			sec_level = BT_IO_SEC_HIGH;
+	}
+	DBG("Sec level is %d ssp_cap is %d", sec_level, is_ssp_cap);
 
 	conn->io = bt_io_connect(BT_IO_L2RAW, bonding_connect_cb, conn,
 					NULL, &err,
@@ -3701,6 +3891,14 @@ static int hciops_retry_authentication(int index, bdaddr_t *bdaddr)
 	return request_authentication(index, bdaddr);
 }
 
+static int hciops_set_connection_params(int index, bdaddr_t *bdaddr,
+		uint16_t interval_min, uint16_t interval_max,
+		uint16_t slave_latency, uint16_t timeout_multiplier)
+{
+	DBG("index %d", index);
+	return -ENOSYS;
+}
+
 static struct btd_adapter_ops hci_ops = {
 	.setup = hciops_setup,
 	.cleanup = hciops_cleanup,
@@ -3742,6 +3940,7 @@ static struct btd_adapter_ops hci_ops = {
 	.remove_remote_oob_data = hciops_remove_remote_oob_data,
 	.set_link_timeout = hciops_set_link_timeout,
 	.retry_authentication = hciops_retry_authentication,
+	.set_connection_params = hciops_set_connection_params,
 };
 
 static int hciops_init(void)

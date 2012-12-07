@@ -781,13 +781,13 @@ static void channel_disconnect(void *user_data)
 {
 	struct gatt_channel *channel = user_data;
 
-	g_attrib_unref(channel->attrib);
 	clients = g_slist_remove(clients, channel);
 
 	g_slist_free(channel->notify);
 	g_slist_free(channel->indicate);
 	g_slist_foreach(channel->configs, (GFunc) g_free, NULL);
 	g_slist_free(channel->configs);
+	g_attrib_set_disconnect_server_function(channel->attrib, NULL, NULL);
 
 	g_free(channel);
 }
@@ -916,51 +916,57 @@ done:
 							NULL, NULL, NULL);
 }
 
-static void connect_event(GIOChannel *io, GError *err, void *user_data)
+void attrib_server_attach(struct _GAttrib *attrib, bdaddr_t *src, bdaddr_t *dst, guint mtu)
 {
 	struct gatt_channel *channel;
 	uint16_t cid;
 	GError *gerr = NULL;
+
+	DBG("");
+	channel = g_new0(struct gatt_channel, 1);
+
+	if (mtu == ATT_DEFAULT_LE_MTU)
+		channel->le = TRUE;
+	else
+		channel->le = FALSE;
+
+	channel->mtu = mtu;
+	channel->attrib = attrib;
+	channel->src = *src;
+	channel->dst = *dst;
+
+	channel->id = g_attrib_register(attrib, GATTRIB_ALL_REQS,
+				channel_handler, channel, NULL);
+
+	g_attrib_set_disconnect_server_function(attrib, channel_disconnect,
+								channel);
+
+	clients = g_slist_append(clients, channel);
+}
+
+static void connect_event(GIOChannel *io, GError *err, void *user_data)
+{
+	GAttrib *attrib;
+	uint16_t omtu;
+	bdaddr_t src, dst;
 
 	if (err) {
 		error("%s", err->message);
 		return;
 	}
 
-	channel = g_new0(struct gatt_channel, 1);
-
-	bt_io_get(io, BT_IO_L2CAP, &gerr,
-			BT_IO_OPT_SOURCE_BDADDR, &channel->src,
-			BT_IO_OPT_DEST_BDADDR, &channel->dst,
-			BT_IO_OPT_CID, &cid,
-			BT_IO_OPT_OMTU, &channel->mtu,
-			BT_IO_OPT_INVALID);
-	if (gerr) {
-		error("bt_io_get: %s", gerr->message);
-		g_error_free(gerr);
-		g_free(channel);
-		g_io_channel_shutdown(io, TRUE, NULL);
-		return;
-	}
-
-	if (channel->mtu > ATT_MAX_MTU)
-		channel->mtu = ATT_MAX_MTU;
-
-	if (cid != ATT_CID)
-		channel->le = FALSE;
-	else
-		channel->le = TRUE;
-
-	channel->attrib = g_attrib_new(io);
+	attrib = g_attrib_new(io);
 	g_io_channel_unref(io);
+	if (attrib) {
+		if (bt_io_get(io, BT_IO_L2CAP, NULL,
+					BT_IO_OPT_OMTU, &omtu,
+					BT_IO_OPT_SOURCE_BDADDR, &src,
+					BT_IO_OPT_DEST_BDADDR, &dst,
+					BT_IO_OPT_INVALID)) {
 
-	channel->id = g_attrib_register(channel->attrib, GATTRIB_ALL_EVENTS,
-				channel_handler, channel, NULL);
-
-	g_attrib_set_disconnect_function(channel->attrib, channel_disconnect,
-								channel);
-
-	clients = g_slist_append(clients, channel);
+			attrib_server_attach(attrib, &src, &dst, omtu);
+		}
+	}
 }
 
 static void confirm_event(GIOChannel *io, void *user_data)

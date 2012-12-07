@@ -29,6 +29,11 @@ LOCAL_CFLAGS:= \
 	-DANDROID \
 	-D__S_IFREG=0100000  # missing from bionic stat.h
 
+ifneq ($(TARGET_BOARD_PLATFORM),mrst)
+LOCAL_CFLAGS += \
+	-DENABLE_CSR_APTX_CODEC
+endif
+
 LOCAL_C_INCLUDES:= \
 	$(LOCAL_PATH)/../lib \
 	$(LOCAL_PATH)/../gdbus \
@@ -42,7 +47,8 @@ LOCAL_SHARED_LIBRARIES := \
 	libbluetoothd \
 	libbtio \
 	libdbus \
-	libglib
+	libglib \
+	libcutils
 
 
 LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/bluez-plugin
@@ -77,13 +83,24 @@ endif
 # to improve SBC performance
 LOCAL_CFLAGS:= -funroll-loops
 
+ifneq ($(TARGET_BOARD_PLATFORM),mrst)
+LOCAL_CFLAGS += \
+	-DENABLE_CSR_APTX_CODEC
+endif
+
 LOCAL_C_INCLUDES:= \
 	$(LOCAL_PATH)/../sbc \
 	../../../../frameworks/base/include \
 	system/bluetooth/bluez-clean-headers
 
 LOCAL_SHARED_LIBRARIES := \
-	libcutils
+	libutils \
+	libcutils \
+
+ifneq ($(TARGET_BOARD_PLATFORM),mrst)
+LOCAL_SHARED_LIBRARIES += \
+    libbt-aptx-4.0.4
+endif
 
 ifneq ($(wildcard system/bluetooth/legacy.mk),)
 LOCAL_STATIC_LIBRARIES := \

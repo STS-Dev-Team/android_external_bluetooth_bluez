@@ -215,7 +215,7 @@ static int write_key(const char *pathname, const char *key, const char *value, i
 	}
 
 	map = mmap(NULL, size, PROT_READ | PROT_WRITE,
-					MAP_PRIVATE | MAP_LOCKED, fd, 0);
+					MAP_PRIVATE, fd, 0);
 	if (!map || map == MAP_FAILED) {
 		err = errno;
 		goto unlock;

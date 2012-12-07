@@ -28,13 +28,95 @@ Local Service hierarchy
 =======================
 
 Service		org.bluez
-Interface	org.bluez.Service
-		org.bluez.Characteristic
-Object path	[prefix]/{hci0}/{service0, service1, ...}
+Interface	org.bluez.Gatt
+Object path	[prefix]/{hci0}
 
-Methods
+Methods		RegisterService(object service, uint16 size, string uuid, boolean sdp, boolean eir)
+			Register a GATT Service to handle a range of ATT attributes. Required Parameters
+			are the Object path to the D-Bus entity that will handle incoming ATT opcodes,
+			and the size of the service being registered measured in number of contiguous
+			attributes in the local dB. Optionally, a UUID (in standard uuid128 format) may
+			be provided, which will cause the requested service to appear in the local SDP dB,
+			and/or the local Extended Inquiry Response. This call will typically be made once in
+			the lifetime of the service such as during an App install.
 
-Properties
+
+			A Failure response will be returned if the specified service object path has already
+			been registered, or if the requested space is unavailable in the local Attribute dB.
+
+		UnRegisterService(object service)
+			Remove a (Stopped) GATT Service handler from local Attribute dB. Called when the service
+			is uninstalled.
+
+			A Failure response will be returned if the service is currently started, or does not exist.
+
+		uint16 StartService(object service)
+			Start a GATT service that has previously been registered but not started. If service has
+			associated SDP or EIR properties, they will be registered at this time, and the service will
+			start receiving method calls.
+
+			Returned UINT16 will be the offset into Attribute dB the service resides.
+
+		StopService(object service)
+			Stop a GATT service that has previously been started, removing any associated SDP and EIR entries.
+			No method calls will be sent to the Service object path after this method returns.
+
+		Indicate(object remote, uint16 attrHandle, array bytes)
+			Send an ATT Indication to a remote device. Remote device must be currently connected.
+			attrHandle must be Normalized by adjusting for the current Attribute dB offset prior
+			to calling. The byte array may be truncated to fit outgoing MTU.
+
+			A Success return value will be returned if the remote devices successfully responds to the Indicate.
+
+		Notify(object remote, uint16 attrHandle, array bytes)
+			Send an ATT Notification to a remote device. Remote device must be currently connected.
+			attrHandle must be Normalized by adjusting for the current Attribute dB offset prior
+			to calling. The byte array may be truncated to fit outgoing MTU.
+
+			A Success return value will be returned if the remote devices was connected when the
+			Notify was issued, but the transaction is otherwise non-Reliable.
+
+
+Properties	array{dict{object, size}}	RegisteredServices
+			All services currently Registered, Active and Inactive
+
+		array{dict{object, range}}	ActiveServices
+			All services currently Active
+
+Local Service Handler hierarchy
+===============================
+
+Service		unique name
+Interface	org.bluez.GattServiceHandler
+Object path	freely definable but unique
+
+Methods		OffsetChanged(uint16 offset)
+			This method is called if the Master GATT server has reordered the Master Attribute dB.
+			The passed value replaces the starting offset originally returned by StartService.
+		
+		dict{offset, uuid} FindInformation(uint16 rangeStart, uint16 rangeEnd)
+			This method requests an attribute offset + uuid pair that exist within the requested range
+
+		dict{offset, byte array} Read(uint16 offset)
+			This method reads the requested Attribute, relative to the starting offset.
+
+		dict{offset, byte array} ReadUUID(string uuid, uint16 rangeStart, uint16 rangeEnd)
+			This method reads an attribute of the requested UUID if it exists within the requested range.
+
+		dict{start, end} GetGroupRange(string uuid, uint16 rangeStart, uint16 rangeEnd)
+			This method request a group start-end range that exists within the requested range.
+
+		Write(uint16 offset, byte array)
+			This method request a Write of the specified data, requiring a response.
+
+		WriteCmd(uint16 offset, byte array)
+			This method request a Write of the specified data, without a response.
+
+		WriteSignedCmd(uint16 offset, byte array)
+			This method request a Signed Write of the specified data, without a response.
+
+
+Properties	none.
 
 
 Device Service hierarchy
@@ -107,10 +189,22 @@ Methods		dict GetProperties()
 		void SetProperty(string name, variant value)
 
 			Changes the value of the specified property. Only
-			read-write properties can be changed. On success
-			this will emit a PropertyChanged signal.
+			read-write properties can be changed.
+			This method requires no response from the server.
 
 			Possible Errors: org.bluez.Error.InvalidArguments
+
+		void SetPropertyCmd(string name, variant value)
+
+			Changes the value of the specified property. Only
+			read-write properties can be changed.
+			This method requires no response from the server.
+
+			Possible Errors: org.bluez.Error.InvalidArguments.
+
+		byte array UpdateValue()
+			 Read updated characteristic value from server.
+			 On success, the updated value is saved to Properties.
 
 Properties 	string UUID [readonly]
 
@@ -120,6 +214,10 @@ Properties 	string UUID [readonly]
 
 			Optional field containing a friendly name for the
 			Characteristic UUID.
+
+		byte Properties [readonly]
+
+			Properties of the Characteristic.
 
 		string Description [readonly]
 
@@ -141,6 +239,11 @@ Properties 	string UUID [readonly]
 			  uint8  | NameSpace: Name space of description.
 			  uint16 | Description: Description of the characteristic defined
 			         | in a high layer profile.
+
+		uint16 ClientConfiguration [readwrite]
+
+			Optional Characteristic descriptor which defines the
+			Client Configuration for this Characteristic.
 
 		array{byte} Value [readwrite]
 

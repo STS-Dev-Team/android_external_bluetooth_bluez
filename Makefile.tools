@@ -39,7 +39,7 @@ tools_hcitool_SOURCES = tools/hcitool.c src/oui.h src/oui.c \
 tools_hcitool_LDADD = lib/libbluetooth.la
 
 tools_sdptool_SOURCES = tools/sdptool.c src/sdp-xml.h src/sdp-xml.c
-tools_sdptool_LDADD = lib/libbluetooth.la
+tools_sdptool_LDADD = lib/libbluetooth.la @GLIB_LIBS@
 
 tools_ciptool_LDADD = lib/libbluetooth.la
 
@@ -55,7 +55,7 @@ bin_PROGRAMS += attrib/gatttool
 attrib_gatttool_SOURCES = attrib/gatttool.c attrib/att.c attrib/gatt.c \
 				attrib/gattrib.c btio/btio.c \
 				attrib/gatttool.h attrib/interactive.c \
-				attrib/utils.c
+				attrib/utils.c src/log.c
 attrib_gatttool_LDADD = lib/libbluetooth.la @GLIB_LIBS@ @READLINE_LIBS@
 endif
 

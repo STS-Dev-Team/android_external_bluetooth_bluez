@@ -4,7 +4,7 @@
  *
  *  Copyright (C) 2006-2010  Nokia Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
- *
+ *  Copyright (C) 2012, Code Aurora Forum. All rights reserved.
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -92,3 +92,5 @@ int audio_device_request_authorization(struct audio_device *dev,
 					void *user_data);
 
 void audio_device_set_authorized(struct audio_device *dev, gboolean auth);
+
+gboolean audio_device_set_control_timer(struct audio_device *dev);

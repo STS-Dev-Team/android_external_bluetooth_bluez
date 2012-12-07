@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2000-2001  Qualcomm Incorporated
+ *  Copyright (C) 2000-2001, 2010-2011 Code Aurora Forum.  All rights reserved.
  *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
  *
@@ -1096,7 +1096,7 @@ static const char *cmd_help =
 	"Usage:\n"
 	"\tcmd <ogf> <ocf> [parameters]\n"
 	"Example:\n"
-	"\tcmd 0x03 0x0013 0x41 0x42 0x43 0x44\n";
+	"\tcmd 0x03 0x0013 0xAA 0x0000BBCC 0xDDEE 0xFF\n";
 
 static void cmd_cmd(int dev_id, int argc, char **argv)
 {
@@ -1106,6 +1106,7 @@ static void cmd_cmd(int dev_id, int argc, char **argv)
 	int i, opt, len, dd;
 	uint16_t ocf;
 	uint8_t ogf;
+	unsigned long val32;
 
 	for_each_opt(opt, cmd_options, NULL) {
 		switch (opt) {
@@ -1127,8 +1128,29 @@ static void cmd_cmd(int dev_id, int argc, char **argv)
 		return;
 	}
 
-	for (i = 2, len = 0; i < argc && len < (int) sizeof(buf); i++, len++)
-		*ptr++ = (uint8_t) strtol(argv[i], NULL, 16);
+	/* Read in command parameters:
+	 * 0x** -> uint8, 0x**** -> uint16, otherwise uint32 */
+	for (i = 2, len = 0; i < argc && len < (int) sizeof(buf); i++) {
+		unsigned long parm_len = strlen(argv[i]);
+		unsigned char *u8_ptr;
+		unsigned int k;
+
+		/* Sanity check */
+		if(parm_len < 2) {
+			perror("Incorrect command parameter, should be a hex number\n");
+			exit(EXIT_FAILURE);
+		}
+		val32 = strtol(argv[i], NULL, 16);
+		parm_len -= 2; /* skip 0x */
+		val32 = htobl(val32);
+		u8_ptr = (unsigned char *) &val32;
+
+		parm_len = (parm_len <= 2) ? 1 : ((parm_len <= 4) ? 2: 4);
+		for (k = 0; k < parm_len; k++) {
+			*ptr++ = u8_ptr[k];
+			len++;
+		}
+	}
 
 	dd = hci_open_dev(dev_id);
 	if (dd < 0) {
@@ -1165,6 +1187,134 @@ static void cmd_cmd(int dev_id, int argc, char **argv)
 
 	printf("> HCI Event: 0x%02x plen %d\n", hdr->evt, hdr->plen);
 	hex_dump("  ", 20, ptr, len); fflush(stdout);
+
+	hci_close_dev(dd);
+}
+
+static const char *two_help =
+	"Usage:\n"
+	"\ttwo <parameters_cnt> <ogf> <ocf> [parameters] <ogf2> <ocf2> [parameters2]\n"
+	"Example:\n"
+	"\ttwo 3 0x03 0x0013 0xAA 0x0000BBCC 0xDDEE 0x03 0x003A 0x01\n";
+
+static void cmd_two(int dev_id, int argc, char **argv)
+{
+	unsigned char buf[HCI_MAX_EVENT_SIZE], *ptr = buf;
+	unsigned char buf2[HCI_MAX_EVENT_SIZE], *ptr2 = buf2;
+	struct hci_filter flt;
+	hci_event_hdr *hdr;
+	int i, j, opt, len, len2, dd;
+	uint8_t cnt;
+	uint16_t ocf;
+	uint8_t ogf;
+	uint16_t ocf2;
+	uint8_t ogf2;
+	unsigned long val32;
+
+	for_each_opt(opt, cmd_options, NULL) {
+		switch (opt) {
+		default:
+			printf("%s", two_help);
+			return;
+		}
+	}
+	helper_arg(3, -1, &argc, &argv, two_help);
+
+	if (dev_id < 0)
+		dev_id = hci_get_route(NULL);
+
+	errno = 0;
+	cnt = strtol(argv[0], NULL, 10);
+	ogf = strtol(argv[1], NULL, 16);
+	ocf = strtol(argv[2], NULL, 16);
+	if (errno == ERANGE || (ogf > 0x3f) || (ocf > 0x3ff)) {
+		printf("%s", two_help);
+		return;
+	}
+
+	/* Read in command parameters:
+	 * 0x** -> uint8, 0x**** -> uint16, otherwise uint32 */
+	for (i = 3, len = 0, j = 0; i < argc && len < (int) sizeof(buf) && j < cnt; i++, j++) {
+		unsigned long parm_len = strlen(argv[i]);
+		unsigned char *u8_ptr;
+		unsigned int k;
+
+		/* Sanity check */
+		if(parm_len < 2) {
+			perror("Incorrect command parameter, should be a hex number\n");
+			exit(EXIT_FAILURE);
+		}
+		val32 = strtol(argv[i], NULL, 16);
+		parm_len -= 2; /* skip 0x */
+		val32 = htobl(val32);
+		u8_ptr = (unsigned char *) &val32;
+
+		parm_len = (parm_len <= 2) ? 1 : ((parm_len <= 4) ? 2: 4);
+		for (k = 0; k < parm_len; k++) {
+			*ptr++ = u8_ptr[k];
+			len++;
+		}
+	}
+
+	errno = 0;
+	ogf2 = strtol(argv[i++], NULL, 16);
+	ocf2 = strtol(argv[i++], NULL, 16);
+	if (errno == ERANGE || (ogf2 > 0x3f) || (ocf2 > 0x3ff)) {
+		printf("%s", two_help);
+		return;
+	}
+
+	for (len2 = 0; i < argc && len2 < (int) sizeof(buf2); i++) {
+		unsigned long parm_len = strlen(argv[i]);
+		unsigned char *u8_ptr;
+		unsigned int k;
+
+		/* Sanity check */
+		if(parm_len < 2) {
+			perror("Incorrect command parameter, should be a hex number\n");
+			exit(EXIT_FAILURE);
+		}
+		val32 = strtol(argv[i], NULL, 16);
+		parm_len -= 2; /* skip 0x */
+		val32 = htobl(val32);
+		u8_ptr = (unsigned char *) &val32;
+
+		parm_len = (parm_len <= 2) ? 1 : ((parm_len <= 4) ? 2: 4);
+		for (k = 0; k < parm_len; k++) {
+			*ptr2++ = u8_ptr[k];
+			len2++;
+		}
+	}
+
+	dd = hci_open_dev(dev_id);
+	if (dd < 0) {
+		perror("Device open failed");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Setup filter */
+	hci_filter_clear(&flt);
+	hci_filter_set_ptype(HCI_EVENT_PKT, &flt);
+	hci_filter_all_events(&flt);
+	if (setsockopt(dd, SOL_HCI, HCI_FILTER, &flt, sizeof(flt)) < 0) {
+		perror("HCI filter setup failed");
+		exit(EXIT_FAILURE);
+	}
+
+	printf("< HCI Command: ogf 0x%02x, ocf 0x%04x, plen %d\n", ogf, ocf, len);
+	hex_dump("  ", 20, buf, len); fflush(stdout);
+	printf("< HCI Command: ogf 0x%02x, ocf 0x%04x, plen %d\n", ogf2, ocf2, len2);
+	hex_dump("  ", 20, buf2, len2); fflush(stdout);
+
+	if (hci_send_cmd(dd, ogf, ocf, len, buf) < 0) {
+		perror("Send failed");
+		exit(EXIT_FAILURE);
+	}
+
+	if (hci_send_cmd(dd, ogf2, ocf2, len2, buf2) < 0) {
+		perror("Send2 failed");
+		exit(EXIT_FAILURE);
+	}
 
 	hci_close_dev(dd);
 }
@@ -2886,6 +3036,75 @@ static void cmd_lecup(int dev_id, int argc, char **argv)
 	hci_close_dev(dd);
 }
 
+static struct option data_options[] = {
+	{ "help",	0, 0, 'h' },
+	{ 0, 0, 0, 0 }
+};
+
+static const char *data_help =
+	"Usage:\n"
+	"\tdata <handle> <flags> <length>\n"
+	"Example:\n"
+	"\tdata 0x101 0x3 200\n";
+
+static unsigned char data_buf[HCI_MAX_ACL_SIZE];
+
+static void cmd_data(int dev_id, int argc, char **argv)
+{
+	struct hci_filter flt;
+	int opt, dd;
+	uint16_t handle;
+	uint8_t flags;
+	uint16_t dlen;
+
+	for_each_opt(opt, data_options, NULL) {
+		switch (opt) {
+		default:
+			printf("%s", data_help);
+			return;
+		}
+	}
+	helper_arg(3, -1, &argc, &argv, data_help);
+
+	if (dev_id < 0)
+		dev_id = hci_get_route(NULL);
+
+	errno = 0;
+	handle = strtol(argv[0], NULL, 16);
+	flags = strtol(argv[1], NULL, 16);
+	dlen = strtol(argv[2], NULL, 10);
+	if (errno == ERANGE || (handle > 0xeff) || (flags > 0xf) || (dlen > HCI_MAX_ACL_SIZE)) {
+		printf("%s", cmd_help);
+		return;
+	}
+
+	dd = hci_open_dev(dev_id);
+	if (dd < 0) {
+		perror("Device open failed");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Setup filter */
+	hci_filter_clear(&flt);
+	hci_filter_set_ptype(HCI_EVENT_PKT, &flt);
+	hci_filter_all_events(&flt);
+	if (setsockopt(dd, SOL_HCI, HCI_FILTER, &flt, sizeof(flt)) < 0) {
+		perror("HCI filter setup failed");
+		exit(EXIT_FAILURE);
+	}
+
+	printf("< HCI Data: handle 0x%03x, flags 0x%x, dlen %d\n", handle, flags, dlen);
+	hex_dump("  ", 20, data_buf, dlen); fflush(stdout);
+
+	if (hci_send_data(dd, handle, flags, dlen, data_buf) < 0) {
+		perror("Send failed");
+		exit(EXIT_FAILURE);
+	}
+
+	hci_close_dev(dd);
+	return;
+}
+
 static struct {
 	char *cmd;
 	void (*func)(int dev_id, int argc, char **argv);
@@ -2899,6 +3118,7 @@ static struct {
 	{ "spinq",    cmd_spinq,   "Start periodic inquiry"               },
 	{ "epinq",    cmd_epinq,   "Exit periodic inquiry"                },
 	{ "cmd",      cmd_cmd,     "Submit arbitrary HCI commands"        },
+	{ "two",      cmd_two,     "Submit two arbitrary HCI commands"    },
 	{ "con",      cmd_con,     "Display active connections"           },
 	{ "cc",       cmd_cc,      "Create connection to remote device"   },
 	{ "dc",       cmd_dc,      "Disconnect from remote device"        },
@@ -2923,6 +3143,7 @@ static struct {
 	{ "lecc",     cmd_lecc,    "Create a LE Connection"               },
 	{ "ledc",     cmd_ledc,    "Disconnect a LE Connection"           },
 	{ "lecup",    cmd_lecup,   "LE Connection Update"                 },
+	{ "data",     cmd_data,    "Send HCI data"                        },
 	{ NULL, NULL, 0 }
 };
 
@@ -2955,6 +3176,10 @@ int main(int argc, char *argv[])
 {
 	int opt, i, dev_id = -1;
 	bdaddr_t ba;
+
+	for (i = 0; i < sizeof(data_buf); i++) {
+		data_buf[i] = i % 256;
+	}
 
 	while ((opt=getopt_long(argc, argv, "+i:h", main_options, NULL)) != -1) {
 		switch (opt) {

@@ -29,6 +29,7 @@ typedef enum {
 	SINK_STATE_CONNECTING,
 	SINK_STATE_CONNECTED,
 	SINK_STATE_PLAYING,
+	SINK_STATE_DISCONNECTING
 } sink_state_t;
 
 typedef void (*sink_state_cb) (struct audio_device *dev,

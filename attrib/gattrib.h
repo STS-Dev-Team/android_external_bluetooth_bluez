@@ -29,6 +29,9 @@ extern "C" {
 #endif
 
 #define GATTRIB_ALL_EVENTS 0xFF
+#define GATTRIB_ALL_REQS 0xFE
+
+#define GATT_TIMEOUT 30
 
 struct _GAttrib;
 typedef struct _GAttrib GAttrib;
@@ -47,6 +50,8 @@ void g_attrib_unref(GAttrib *attrib);
 GIOChannel *g_attrib_get_channel(GAttrib *attrib);
 
 gboolean g_attrib_set_disconnect_function(GAttrib *attrib,
+		GAttribDisconnectFunc disconnect, gpointer user_data);
+gboolean g_attrib_set_server_disconnect_function(GAttrib *attrib,
 		GAttribDisconnectFunc disconnect, gpointer user_data);
 
 gboolean g_attrib_set_destroy_function(GAttrib *attrib,
@@ -73,6 +78,10 @@ gboolean g_attrib_set_mtu(GAttrib *attrib, int mtu);
 
 gboolean g_attrib_unregister(GAttrib *attrib, guint id);
 gboolean g_attrib_unregister_all(GAttrib *attrib);
+
+void attrib_server_attach(struct _GAttrib *attrib, bdaddr_t *src, bdaddr_t *dst,
+								guint mtu);
+
 
 #ifdef __cplusplus
 }

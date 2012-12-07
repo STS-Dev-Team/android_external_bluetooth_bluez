@@ -4,7 +4,7 @@
  *
  *  Copyright (C) 2006-2010  Nokia Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
- *
+ *  Copyright (C) 2012, Code Aurora Forum. All rights reserved.
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -45,6 +45,7 @@
 #include "textfile.h"
 #include "../src/adapter.h"
 #include "../src/device.h"
+#include "storage.h"
 
 #include "error.h"
 #include "ipc.h"
@@ -60,9 +61,10 @@
 
 #define AUDIO_INTERFACE "org.bluez.Audio"
 
-#define CONTROL_CONNECT_TIMEOUT 2
+#define CONTROL_CONNECT_TIMEOUT 4
 #define AVDTP_CONNECT_TIMEOUT 1
 #define HEADSET_CONNECT_TIMEOUT 1
+#define AVRCP_CONNECT_TIMEOUT 300
 
 typedef enum {
 	AUDIO_STATE_DISCONNECTED,
@@ -175,6 +177,29 @@ static gboolean device_set_control_timer(struct audio_device *dev)
 							dev);
 
 	return TRUE;
+}
+
+static gboolean device_set_control_delay_timer(struct audio_device *dev)
+{
+	struct dev_priv *priv = dev->priv;
+
+	if (!dev->control)
+		return FALSE;
+
+	if (priv->control_timer)
+		return FALSE;
+
+	priv->control_timer=g_timeout_add_full(G_PRIORITY_HIGH_IDLE,
+						AVRCP_CONNECT_TIMEOUT,
+						control_connect_timeout,
+						dev,
+						NULL);
+	return TRUE;
+}
+
+gboolean audio_device_set_control_timer(struct audio_device *dev)
+{
+	return device_set_control_timer(dev);
 }
 
 static void device_remove_control_timer(struct audio_device *dev)
@@ -365,10 +390,12 @@ static void device_avdtp_cb(struct audio_device *dev, struct avdtp *session,
 		return;
 
 	if (new_state == AVDTP_SESSION_STATE_CONNECTED) {
-		if (avdtp_stream_setup_active(session))
+		uint8_t match = 0;
+		read_special_map_devaddr("avrcp_delay", &(dev->dst), &match);
+		if (avdtp_stream_setup_active(session) || match)
 			device_set_control_timer(dev);
 		else
-			avrcp_connect(dev);
+			device_set_control_delay_timer(dev);
 	}
 }
 
@@ -828,8 +855,15 @@ int audio_device_request_authorization(struct audio_device *dev,
 int audio_device_cancel_authorization(struct audio_device *dev,
 					authorization_cb cb, void *user_data)
 {
-	struct dev_priv *priv = dev->priv;
+	struct dev_priv *priv;
 	GSList *l, *next;
+
+	if (dev)
+		priv = dev->priv;
+	else {
+		DBG("NULL argument for device!!!");
+		return 0;
+	}
 
 	for (l = priv->auths; l != NULL; l = next) {
 		struct service_auth *auth = l->data;

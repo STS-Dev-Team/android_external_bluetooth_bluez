@@ -4,6 +4,7 @@
  *
  *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2009-2010  Motorola Corporation
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -38,3 +39,11 @@ int dun_kill_all_connections(void);
 int dun_open_connection(int sk, char *pppd, char **pppd_opts, int wait);
 
 int ms_dun(int fd, int server, int timeo);
+
+/* DBUS functions */
+#ifdef ANDROID_BLUETOOTHDUN
+void dun_add_watch(int sk);
+void dun_remove_watch();
+int  dun_dbus_init(void);
+void dun_dbus_clean(void);
+#endif

@@ -23,46 +23,47 @@
  *
  */
 
-/* Timeout for hci_send_req (milliseconds) */
-#define HCI_REQ_TIMEOUT		5000
+#ifndef __HCI_VS_H
+#define __HCI_VS_H
 
-struct main_opts {
-	char		host_name[40];
-	unsigned long	flags;
-	char		*name;
-	uint32_t	class;
-	uint16_t	pageto;
-	uint32_t	discovto;
-	uint32_t	pairto;
-	uint16_t	link_mode;
-	uint16_t	link_policy;
-	gboolean	remember_powered;
-	gboolean	reverse_sdp;
-	gboolean	name_resolv;
-	gboolean	debug_keys;
-	gboolean	attrib_server;
-	gboolean	le;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-	uint8_t		mode;
-	uint8_t		discov_interval;
-	char		deviceid[40]; /* FIXME: */
-};
+#include "hci_vs_lib.h"
 
-enum {
-	HCID_SET_NAME,
-	HCID_SET_CLASS,
-	HCID_SET_PAGETO,
-	HCID_SET_DISCOVTO,
-};
+#define OGF_VS	0x3F
 
-extern struct main_opts main_opts;
+#define OCF_VS_WRITE_CODEC_CONFIG	0x0106
+#define OCF_VS_BTIP1_1_SET_FM_AUDIO_PATH	0x0195
 
-void btd_start_exit_timer(void);
-void btd_stop_exit_timer(void);
+typedef struct {
+	pcm_clock_t pcm_clock;
+	frame_sync_t frame_sync;
+	/* reserved */
+	uint8_t reserved_1;
+	channel_data_t channel_1_data_out;
+	channel_data_t channel_1_data_in;
+	/* reserved */
+	uint8_t reserved_2;
+	channel_data_t channel_2_data_out;
+	channel_data_t channel_2_data_in;
+	/* reserved */
+	uint8_t reserved_3;
+} __attribute__ ((packed)) vs_write_codec_config_cp;
+#define VS_WRITE_CODEC_CONFIG_SIZE 34
 
-gboolean plugin_init(GKeyFile *config, const char *enable,
-							const char *disable);
-void plugin_cleanup(void);
+typedef struct {
+	uint32_t pcmi_override;
+	uint32_t i2s_override;
+	uint8_t bluetooth_audio_path;
+	uint8_t fm_audio_path;
+	uint8_t tdm_enable;
+}__attribute__ ((packed)) vs_btip1_1_set_fm_audio_path_cp;
+#define VS_BTIP1_1_SET_FM_AUDIO_PATH_SIZE 11
 
-void rfkill_init(void);
-void rfkill_exit(void);
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __HCI_VS_H */

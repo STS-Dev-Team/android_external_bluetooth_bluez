@@ -3,6 +3,7 @@
  *  BlueZ - Bluetooth protocol stack for Linux
  *
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -36,17 +37,29 @@ int write_local_name(bdaddr_t *bdaddr, const char *name);
 int read_local_name(bdaddr_t *bdaddr, char *name);
 int write_local_class(bdaddr_t *bdaddr, uint8_t *class);
 int read_local_class(bdaddr_t *bdaddr, uint8_t *class);
+int write_remote_appearance(bdaddr_t *local, bdaddr_t *peer, uint16_t appearance);
+int read_remote_appearance(bdaddr_t *local, bdaddr_t *peer, uint16_t *appearance);
 int write_remote_class(bdaddr_t *local, bdaddr_t *peer, uint32_t class);
 int read_remote_class(bdaddr_t *local, bdaddr_t *peer, uint32_t *class);
 int write_device_name(bdaddr_t *local, bdaddr_t *peer, char *name);
 int read_device_name(const char *src, const char *dst, char *name);
 int write_remote_eir(bdaddr_t *local, bdaddr_t *peer, uint8_t *data);
 int read_remote_eir(bdaddr_t *local, bdaddr_t *peer, uint8_t *data);
+int read_version_info(bdaddr_t *local, bdaddr_t *peer, uint16_t *version);
 int write_version_info(bdaddr_t *local, bdaddr_t *peer, uint16_t manufacturer, uint8_t lmp_ver, uint16_t lmp_subver);
 int write_features_info(bdaddr_t *local, bdaddr_t *peer, unsigned char *page1, unsigned char *page2);
 int read_remote_features(bdaddr_t *local, bdaddr_t *peer, unsigned char *page1, unsigned char *page2);
 int write_lastseen_info(bdaddr_t *local, bdaddr_t *peer, struct tm *tm);
 int write_lastused_info(bdaddr_t *local, bdaddr_t *peer, struct tm *tm);
+int write_le_key(bdaddr_t *local, bdaddr_t *peer, uint8_t addr_type, uint32_t *hash,
+		unsigned char *key, uint8_t type, uint8_t length, uint8_t auth,
+		uint8_t dlen, uint8_t *data);
+int read_le_key(bdaddr_t *local, bdaddr_t *peer, uint8_t *addr_type,
+		uint32_t *hash, uint8_t *length, uint8_t *auth,
+		unsigned char *key, uint8_t type, uint8_t *dlen,
+		uint8_t *data, uint8_t max_dlen);
+uint32_t read_le_hash(bdaddr_t *local, bdaddr_t *peer, uint8_t *mid, uint8_t len);
+int delete_le_keys(bdaddr_t *local, bdaddr_t *peer, uint32_t hash);
 int write_link_key(bdaddr_t *local, bdaddr_t *peer, unsigned char *key, uint8_t type, int length);
 int read_link_key(bdaddr_t *local, bdaddr_t *peer, unsigned char *key, uint8_t *type);
 int read_pin_code(bdaddr_t *local, bdaddr_t *peer, char *pin);
@@ -85,8 +98,25 @@ int write_device_attribute(const bdaddr_t *sba, const bdaddr_t *dba,
                                         uint16_t handle, const char *chars);
 int read_device_attributes(const bdaddr_t *sba, textfile_cb func, void *data);
 int write_device_type(const bdaddr_t *sba, const bdaddr_t *dba,
-						device_type_t type);
-device_type_t read_device_type(const bdaddr_t *sba, const bdaddr_t *dba);
+						addr_type_t type);
+addr_type_t read_device_type(const bdaddr_t *sba, const bdaddr_t *dba);
+int read_special_map_devaddr(char *category, bdaddr_t *peer, uint8_t *match);
+int read_special_map_devname(char *category, char *name, uint8_t *match);
 
 #define PNP_UUID		"00001200-0000-1000-8000-00805f9b34fb"
 
+#define KEY_TYPE_LTK		0x11
+#define KEY_TYPE_IRK		0x12
+#define KEY_TYPE_CSRK		0x13
+
+#define LE_STORE_LTK	0x01
+#define LE_STORE_IRK	0x02
+#define LE_STORE_CSRK	0x04
+
+#define LE_KEY_HDR_LEN	30
+#define LE_KEY_LTK_LEN	54
+#define LE_KEY_IRK_LEN	54
+#define LE_KEY_CSRK_LEN	42
+
+#define LE_KEY_LEN	(LE_KEY_HDR_LEN + LE_KEY_LTK_LEN + \
+			LE_KEY_IRK_LEN + LE_KEY_CSRK_LEN)

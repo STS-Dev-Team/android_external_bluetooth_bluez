@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2000-2001  Qualcomm Incorporated
+ *  Copyright (C) 2000-2001, 2010 Code Aurora Forum.  All rights reserved.
  *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
  *
@@ -47,6 +47,7 @@
 #include <bluetooth/l2cap.h>
 
 #define NIBBLE_TO_ASCII(c)  ((c) < 0x0a ? (c) + 0x30 : (c) + 0x57)
+#define KB_POLLING_USEC	(50000) /* 50 ms */
 
 /* Test modes */
 enum {
@@ -76,10 +77,13 @@ static int omtu = 0;
 static int fcs = 0x01;
 
 /* Default Transmission Window */
-static int txwin_size = 63;
+static int txwin_size = L2CAP_DEFAULT_TX_WINDOW;
 
-/* Default Max Transmission */
-static int max_transmit = 3;
+/* Default Max Transmission (number of retries per packet) */
+static int max_transmit = L2CAP_DEFAULT_MAX_TX;
+
+/* Default AMP preference */
+static int amp_pref = BT_AMP_POLICY_REQUIRE_BR_EDR;
 
 /* Default data size */
 static long data_size = -1;
@@ -189,6 +193,46 @@ static void hexdump(unsigned char *s, unsigned long l)
 	}
 }
 
+static void do_keys(int sk)
+{
+	struct pollfd p;
+	int len;
+	char c;
+	int old_amp_pref = amp_pref;
+
+	p.fd = 0;
+	p.events = POLLIN;
+
+	if (poll(&p, 1, 0)) {
+		len = read(0, &c, 1);
+		if (len < 0)
+			return;
+
+		switch (c) {
+		case 'A':
+		case 'a':
+			amp_pref = BT_AMP_POLICY_PREFER_AMP;
+			break;
+		case 'B':
+		case 'b':
+			amp_pref = BT_AMP_POLICY_PREFER_BR_EDR;
+			break;
+		case 'R':
+		case 'r':
+			amp_pref = BT_AMP_POLICY_REQUIRE_BR_EDR;
+			break;
+		default:
+			return;
+		}
+
+		setsockopt(sk, SOL_BLUETOOTH, BT_AMP_POLICY, &amp_pref, sizeof(amp_pref));
+		syslog(LOG_INFO, "AMP preference updated to %d (previously %d)",
+			   amp_pref, old_amp_pref);
+	}
+
+	return;
+}
+
 static int do_connect(char *svr)
 {
 	struct sockaddr_l2 addr;
@@ -230,6 +274,10 @@ static int do_connect(char *svr)
 	opts.omtu = omtu;
 	opts.imtu = imtu;
 	opts.mode = rfcmode;
+
+	opts.fcs = fcs;
+	opts.txwin_size = txwin_size;
+	opts.max_tx = max_transmit;
 
 	opts.fcs = fcs;
 	opts.txwin_size = txwin_size;
@@ -282,6 +330,13 @@ static int do_connect(char *svr)
 		syslog(LOG_ERR, "Can't set L2CAP link mode: %s (%d)",
 							strerror(errno), errno);
 		goto error;
+	}
+
+	/* Set AMP preference */
+	if ((rfcmode == L2CAP_MODE_ERTM || rfcmode == L2CAP_MODE_STREAMING) &&
+		setsockopt(sk, SOL_BLUETOOTH, BT_AMP_POLICY, &amp_pref, sizeof(amp_pref)) < 0) {
+		syslog(LOG_ERR, "Can't set L2CAP AMP preference: %s (%d)",
+							strerror(errno), errno);
 	}
 
 	/* Connect to remote device */
@@ -470,6 +525,13 @@ static void do_listen(void (*handler)(int sk))
 		/* Child */
 		close(sk);
 
+		/* Set AMP preference */
+		if ((rfcmode == L2CAP_MODE_ERTM || rfcmode == L2CAP_MODE_STREAMING) &&
+			setsockopt(nsk, SOL_BLUETOOTH, BT_AMP_POLICY, &amp_pref, sizeof(amp_pref)) < 0) {
+			syslog(LOG_ERR, "Can't set L2CAP AMP preference: %s (%d)",
+				   strerror(errno), errno);
+		}
+
 		/* Get current options */
 		memset(&opts, 0, sizeof(opts));
 		optlen = sizeof(opts);
@@ -577,10 +639,16 @@ static void dump_mode(int sk)
 		fd_set rset;
 
 		FD_ZERO(&rset);
+		FD_SET(0, &rset);
 		FD_SET(sk, &rset);
 
 		if (select(sk + 1, &rset, NULL, NULL, NULL) < 0)
 			return;
+
+		if (FD_ISSET(0, &rset)) {
+			do_keys(sk);
+			continue;
+		}
 
 		if (!FD_ISSET(sk, &rset))
 			continue;
@@ -613,12 +681,14 @@ static void dump_mode(int sk)
 static void recv_mode(int sk)
 {
 	struct timeval tv_beg, tv_end, tv_diff;
-	struct pollfd p;
+	struct pollfd p[2];
 	char ts[30];
-	long total;
+	long total, cumtotal;
 	uint32_t seq;
 	socklen_t optlen;
 	int opt, len;
+
+	cumtotal = 0;
 
 	if (data_size < 0)
 		data_size = imtu;
@@ -636,8 +706,11 @@ static void recv_mode(int sk)
 
 	memset(ts, 0, sizeof(ts));
 
-	p.fd = sk;
-	p.events = POLLIN | POLLERR | POLLHUP;
+	p[0].fd = sk;
+	p[0].events = POLLIN | POLLERR | POLLHUP;
+
+	p[1].fd = 0;
+	p[1].events = POLLIN;
 
 	seq = 0;
 	while (1) {
@@ -648,12 +721,18 @@ static void recv_mode(int sk)
 			uint16_t l;
 			int i;
 
-			p.revents = 0;
-			if (poll(&p, 1, -1) <= 0)
+			p[0].revents = 0;
+			p[1].revents = 0;
+			if (poll(p, 2, -1) <= 0)
 				return;
 
-			if (p.revents & (POLLERR | POLLHUP))
+			if (p[0].revents & (POLLERR | POLLHUP))
 				return;
+
+			if (p[1].revents & POLLIN) {
+				do_keys(sk);
+				continue;
+			}
 
 			len = recv(sk, buf, data_size, 0);
 			if (len < 0) {
@@ -709,12 +788,13 @@ static void recv_mode(int sk)
 			}
 
 			total += len;
+			cumtotal += len;
 		}
 		gettimeofday(&tv_end, NULL);
 
 		timersub(&tv_end, &tv_beg, &tv_diff);
 
-		syslog(LOG_INFO,"%s%ld bytes in %.2f sec, %.2f kB/s", ts, total,
+		syslog(LOG_INFO,"%s%ld bytes (%ld cum total) in %.2f sec, %.2f kB/s", ts, total, cumtotal,
 			tv2fl(tv_diff), (float)(total / tv2fl(tv_diff) ) / 1024.0);
 	}
 }
@@ -753,6 +833,16 @@ static void do_send(int sk)
 			buf[i] = 0x7f;
 	}
 
+	if (num_frames && delay && count) {
+		int d = delay/KB_POLLING_USEC;
+		syslog(LOG_INFO, "Delay before first send ...");
+		while (d > 0) {
+			do_keys(sk);
+			usleep(KB_POLLING_USEC);
+			d--;
+		}
+	}
+
 	seq = 0;
 	while ((num_frames == -1) || (num_frames-- > 0)) {
 		*(uint32_t *) buf = htobl(seq);
@@ -773,10 +863,19 @@ static void do_send(int sk)
 
 			sent += len;
 			size -= len;
+
+			do_keys(sk);
 		}
 
-		if (num_frames && delay && count && !(seq % count))
-			usleep(delay);
+		if (num_frames && delay && count && !(seq % count)) {
+			int d = delay/KB_POLLING_USEC;
+			syslog(LOG_INFO, "Delaying before next send ...");
+			while (d > 0) {
+				do_keys(sk);
+				usleep(KB_POLLING_USEC);
+				d--;
+			}
+		}
 	}
 }
 
@@ -824,19 +923,27 @@ static void reconnect_mode(char *svr)
 
 static void connect_mode(char *svr)
 {
-	struct pollfd p;
+	struct pollfd p[2];
 	int sk;
 
 	if ((sk = do_connect(svr)) < 0)
 		exit(1);
 
-	p.fd = sk;
-	p.events = POLLERR | POLLHUP;
+	p[0].fd = sk;
+	p[0].events = POLLERR | POLLHUP;
+
+	p[1].fd = 0;
+	p[1].events = POLLIN;
 
 	while (1) {
-		p.revents = 0;
-		if (poll(&p, 1, 500))
+		p[0].revents = 0;
+		p[1].revents = 0;
+		if (poll(p, 2, 500) < 0)
 			break;
+		if (p[0].revents & (POLLERR | POLLHUP))
+			break;
+		if (p[1].revents & POLLIN)
+			do_keys(sk);
 	}
 
 	syslog(LOG_INFO, "Disconnected");
@@ -1085,8 +1192,10 @@ static void usage(void)
 		"\t[-D milliseconds] delay after sending num frames (default = 0)\n"
 		"\t[-X mode] select retransmission/flow-control mode\n"
 		"\t[-F fcs] use CRC16 check (default = 1)\n"
-		"\t[-Q num] Max Transmit value (default = 3)\n"
-		"\t[-Z size] Transmission Window size (default = 63)\n"
+		"\t[-Q num] retransmit each packet up to num times (default = 3)\n"
+		"\t[-Z size] use window for num unacked incoming packets (default = 63)\n"
+		"\t[-K amp] declare amp preference\n"
+		"\t         (require_br_edr, prefer_amp, prefer_br_edr)\n"
 		"\t[-R] reliable mode\n"
 		"\t[-G] use connectionless channel (datagram)\n"
 		"\t[-U] use sock stream\n"
@@ -1104,7 +1213,7 @@ int main(int argc, char *argv[])
 
 	bacpy(&bdaddr, BDADDR_ANY);
 
-	while ((opt=getopt(argc,argv,"rdscuwmntqxyzpb:i:P:I:O:J:B:N:L:W:C:D:X:F:Q:Z:RUGAESMT")) != EOF) {
+	while ((opt=getopt(argc,argv,"rdscuwmntqxyzpb:i:P:I:O:J:B:N:L:W:C:D:X:F:Q:Z:K:RUGAESMT")) != EOF) {
 		switch(opt) {
 		case 'r':
 			mode = RECV;
@@ -1218,14 +1327,30 @@ int main(int argc, char *argv[])
 			break;
 
 		case 'X':
-			if (strcasecmp(optarg, "ertm") == 0)
+			if (strcasecmp(optarg, "ertm-mandatory") == 0) {
 				rfcmode = L2CAP_MODE_ERTM;
+				socktype = SOCK_STREAM;
+			} else if (strcasecmp(optarg, "ertm") == 0)
+				rfcmode = L2CAP_MODE_ERTM;
+			else if (strcasecmp(optarg, "streaming") == 0)
+				rfcmode = L2CAP_MODE_STREAMING;
 			else
 				rfcmode = atoi(optarg);
 			break;
 
 		case 'F':
 			fcs = atoi(optarg);
+			break;
+
+		case 'K':
+			if (strcasecmp(optarg, "require_br_edr") == 0)
+				amp_pref = BT_AMP_POLICY_REQUIRE_BR_EDR;
+			else if (strcasecmp(optarg, "prefer_amp") == 0)
+				amp_pref = BT_AMP_POLICY_PREFER_AMP;
+			else if (strcasecmp(optarg, "prefer_br_edr") == 0)
+				amp_pref = BT_AMP_POLICY_PREFER_BR_EDR;
+			else
+				perror("Bad AMP preference");
 			break;
 
 		case 'R':

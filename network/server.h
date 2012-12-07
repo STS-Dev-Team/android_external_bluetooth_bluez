@@ -21,7 +21,7 @@
  *
  */
 
-int server_init(DBusConnection *conn, gboolean secure);
+int server_init(DBusConnection *conn, gboolean secure, gboolean master_role);
 void server_exit(void);
 int server_register(struct btd_adapter *adapter);
 int server_unregister(struct btd_adapter *adapter);

@@ -6,6 +6,7 @@
  *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
  *  Copyright (C) 2002-2003  Stephen Crane <steve.crane@rococosoft.com>
+ *  Copyright (C) 2010, Code Aurora Forum. All rights reserved
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -172,11 +173,10 @@ void register_server_service(void)
 	update_db_timestamp();
 }
 
-void register_device_id(const uint16_t vendor, const uint16_t product,
-						const uint16_t version)
+void register_device_id(const uint16_t spec, const uint16_t vendor,
+					const uint16_t product, const uint16_t version,
+					const uint8_t primary, const uint16_t source)
 {
-	const uint16_t spec = 0x0102, source = 0x0002;
-	const uint8_t primary = 1;
 	sdp_list_t *class_list, *group_list, *profile_list;
 	uuid_t class_uuid, group_uuid;
 	sdp_data_t *sdp_data, *primary_data, *source_data;

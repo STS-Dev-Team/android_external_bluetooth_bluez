@@ -28,9 +28,6 @@
 
 #include <bluetooth/uuid.h>
 
-#include <readline/readline.h>
-#include <readline/history.h>
-
 #include "att.h"
 #include "btio.h"
 #include "gattrib.h"
@@ -42,6 +39,9 @@ static GAttrib *attrib = NULL;
 static GMainLoop *event_loop;
 static GString *prompt;
 
+#define INPUT_SIZE	100
+static int didx = 0;
+static gchar *inp = NULL;
 static gchar *opt_src = NULL;
 static gchar *opt_dst = NULL;
 static gchar *opt_sec_level = NULL;
@@ -94,8 +94,8 @@ static char *get_prompt(void)
 static void set_state(enum state st)
 {
 	conn_state = st;
-	rl_set_prompt(get_prompt());
-	rl_redisplay();
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void events_handler(const uint8_t *pdu, uint16_t len, gpointer user_data)
@@ -105,7 +105,7 @@ static void events_handler(const uint8_t *pdu, uint16_t len, gpointer user_data)
 
 	handle = att_get_u16(&pdu[1]);
 
-	printf("\n");
+	printf("\r");
 	switch (pdu[0]) {
 	case ATT_OP_HANDLE_NOTIFY:
 		printf("Notification handle = 0x%04x value: ", handle);
@@ -115,26 +115,29 @@ static void events_handler(const uint8_t *pdu, uint16_t len, gpointer user_data)
 		break;
 	default:
 		printf("Invalid opcode\n");
-		return;
+		goto done;
 	}
 
 	for (i = 3; i < len; i++)
 		printf("%02x ", pdu[i]);
 
-	printf("\n");
-	rl_forced_update_display();
-
 	if (pdu[0] == ATT_OP_HANDLE_NOTIFY)
-		return;
+		goto done;
 
 	olen = enc_confirmation(opdu, sizeof(opdu));
 
 	if (olen > 0)
 		g_attrib_send(attrib, 0, opdu[0], opdu, olen, NULL, NULL, NULL);
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void connect_cb(GIOChannel *io, GError *err, gpointer user_data)
 {
+	bdaddr_t sba, dba;
+
 	if (err) {
 		printf("connect error: %s\n", err->message);
 		set_state(STATE_DISCONNECTED);
@@ -146,6 +149,14 @@ static void connect_cb(GIOChannel *io, GError *err, gpointer user_data)
 							attrib, NULL);
 	g_attrib_register(attrib, ATT_OP_HANDLE_IND, events_handler,
 							attrib, NULL);
+
+	/* LE connections share Client and Server paths */
+	if (!opt_psm) {
+		str2ba(opt_dst, &dba);
+		str2ba(opt_src, &sba);
+		attrib_server_attach(attrib, &sba, &dba, ATT_DEFAULT_LE_MTU);
+	}
+
 	set_state(STATE_CONNECTED);
 }
 
@@ -156,17 +167,19 @@ static void primary_all_cb(GSList *services, guint8 status, gpointer user_data)
 	if (status) {
 		printf("Discover all primary services failed: %s\n",
 							att_ecode2str(status));
-		return;
+		goto done;
 	}
 
-	printf("\n");
+	printf("\r");
 	for (l = services; l; l = l->next) {
 		struct att_primary *prim = l->data;
 		printf("attr handle: 0x%04x, end grp handle: 0x%04x "
 			"uuid: %s\n", prim->start, prim->end, prim->uuid);
 	}
 
-	rl_forced_update_display();
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void primary_by_uuid_cb(GSList *ranges, guint8 status,
@@ -177,7 +190,7 @@ static void primary_by_uuid_cb(GSList *ranges, guint8 status,
 	if (status) {
 		printf("Discover primary services by UUID failed: %s\n",
 							att_ecode2str(status));
-		return;
+		goto done;
 	}
 
 	printf("\n");
@@ -187,7 +200,9 @@ static void primary_by_uuid_cb(GSList *ranges, guint8 status,
 						range->start, range->end);
 	}
 
-	rl_forced_update_display();
+done:
+	printf("\n%s", get_prompt());
+	fflush(stdout);
 }
 
 static void char_cb(GSList *characteristics, guint8 status, gpointer user_data)
@@ -197,7 +212,7 @@ static void char_cb(GSList *characteristics, guint8 status, gpointer user_data)
 	if (status) {
 		printf("Discover all characteristics failed: %s\n",
 							att_ecode2str(status));
-		return;
+		goto done;
 	}
 
 	printf("\n");
@@ -210,7 +225,9 @@ static void char_cb(GSList *characteristics, guint8 status, gpointer user_data)
 				chars->uuid);
 	}
 
-	rl_forced_update_display();
+done:
+	printf("\n%s", get_prompt());
+	fflush(stdout);
 }
 
 static void char_desc_cb(guint8 status, const guint8 *pdu, guint16 plen,
@@ -223,12 +240,12 @@ static void char_desc_cb(guint8 status, const guint8 *pdu, guint16 plen,
 	if (status != 0) {
 		printf("Discover all characteristic descriptors failed: "
 						"%s\n", att_ecode2str(status));
-		return;
+		goto done;
 	}
 
 	list = dec_find_info_resp(pdu, plen, &format);
 	if (list == NULL)
-		return;
+		goto done;
 
 	printf("\n");
 	for (i = 0; i < list->num; i++) {
@@ -251,7 +268,9 @@ static void char_desc_cb(guint8 status, const guint8 *pdu, guint16 plen,
 
 	att_data_list_free(list);
 
-	rl_forced_update_display();
+done:
+	printf("\n%s", get_prompt());
+	fflush(stdout);
 }
 
 static void char_read_cb(guint8 status, const guint8 *pdu, guint16 plen,
@@ -263,20 +282,21 @@ static void char_read_cb(guint8 status, const guint8 *pdu, guint16 plen,
 	if (status != 0) {
 		printf("Characteristic value/descriptor read failed: %s\n",
 							att_ecode2str(status));
-		return;
+		goto done;
 	}
 
 	if (!dec_read_resp(pdu, plen, value, &vlen)) {
 		printf("Protocol error\n");
-		return;
+		goto done;
 	}
 
 	printf("\nCharacteristic value/descriptor: ");
 	for (i = 0; i < vlen; i++)
 		printf("%02x ", value[i]);
-	printf("\n");
 
-	rl_forced_update_display();
+done:
+	printf("\n%s", get_prompt());
+	fflush(stdout);
 }
 
 static void char_read_by_uuid_cb(guint8 status, const guint8 *pdu,
@@ -315,22 +335,22 @@ static void char_read_by_uuid_cb(guint8 status, const guint8 *pdu,
 
 	att_data_list_free(list);
 
-	rl_forced_update_display();
-
 done:
+	printf("\n%s", get_prompt());
+	fflush(stdout);
+
 	g_free(char_data);
 }
 
 static void cmd_exit(int argcp, char **argvp)
 {
-	rl_callback_handler_remove();
 	g_main_loop_quit(event_loop);
 }
 
 static void cmd_connect(int argcp, char **argvp)
 {
 	if (conn_state != STATE_DISCONNECTED)
-		return;
+		goto done;
 
 	if (argcp > 1) {
 		g_free(opt_dst);
@@ -339,7 +359,7 @@ static void cmd_connect(int argcp, char **argvp)
 
 	if (opt_dst == NULL) {
 		printf("Remote Bluetooth address required\n");
-		return;
+		goto done;
 	}
 
 	set_state(STATE_CONNECTING);
@@ -347,12 +367,18 @@ static void cmd_connect(int argcp, char **argvp)
 						opt_mtu, connect_cb);
 	if (iochannel == NULL)
 		set_state(STATE_DISCONNECTED);
+	else
+		return;
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void cmd_disconnect(int argcp, char **argvp)
 {
 	if (conn_state == STATE_DISCONNECTED)
-		return;
+		goto done;
 
 	g_attrib_unref(attrib);
 	attrib = NULL;
@@ -362,6 +388,7 @@ static void cmd_disconnect(int argcp, char **argvp)
 	g_io_channel_unref(iochannel);
 	iochannel = NULL;
 
+done:
 	set_state(STATE_DISCONNECTED);
 }
 
@@ -371,20 +398,25 @@ static void cmd_primary(int argcp, char **argvp)
 
 	if (conn_state != STATE_CONNECTED) {
 		printf("Command failed: disconnected\n");
-		return;
+		goto done;
 	}
 
 	if (argcp == 1) {
 		gatt_discover_primary(attrib, NULL, primary_all_cb, NULL);
-		return;
+		goto done;
 	}
 
 	if (bt_string_to_uuid(&uuid, argvp[1]) < 0) {
 		printf("Invalid UUID\n");
-		return;
+		goto done;
 	}
 
 	gatt_discover_primary(attrib, &uuid, primary_by_uuid_cb, NULL);
+	return;
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static int strtohandle(const char *src)
@@ -407,14 +439,14 @@ static void cmd_char(int argcp, char **argvp)
 
 	if (conn_state != STATE_CONNECTED) {
 		printf("Command failed: disconnected\n");
-		return;
+		goto done;
 	}
 
 	if (argcp > 1) {
 		start = strtohandle(argvp[1]);
 		if (start < 0) {
 			printf("Invalid start handle: %s\n", argvp[1]);
-			return;
+			goto done;
 		}
 	}
 
@@ -422,7 +454,7 @@ static void cmd_char(int argcp, char **argvp)
 		end = strtohandle(argvp[2]);
 		if (end < 0) {
 			printf("Invalid end handle: %s\n", argvp[2]);
-			return;
+			goto done;
 		}
 	}
 
@@ -431,7 +463,7 @@ static void cmd_char(int argcp, char **argvp)
 
 		if (bt_string_to_uuid(&uuid, argvp[3]) < 0) {
 			printf("Invalid UUID\n");
-			return;
+			goto done;
 		}
 
 		gatt_discover_char(attrib, start, end, &uuid, char_cb, NULL);
@@ -439,6 +471,11 @@ static void cmd_char(int argcp, char **argvp)
 	}
 
 	gatt_discover_char(attrib, start, end, NULL, char_cb, NULL);
+	return;
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void cmd_char_desc(int argcp, char **argvp)
@@ -448,14 +485,14 @@ static void cmd_char_desc(int argcp, char **argvp)
 
 	if (conn_state != STATE_CONNECTED) {
 		printf("Command failed: disconnected\n");
-		return;
+		goto done;
 	}
 
 	if (argcp > 1) {
 		start = strtohandle(argvp[1]);
 		if (start < 0) {
 			printf("Invalid start handle: %s\n", argvp[1]);
-			return;
+			goto done;
 		}
 	}
 
@@ -463,11 +500,16 @@ static void cmd_char_desc(int argcp, char **argvp)
 		end = strtohandle(argvp[2]);
 		if (end < 0) {
 			printf("Invalid end handle: %s\n", argvp[2]);
-			return;
+			goto done;
 		}
 	}
 
 	gatt_find_info(attrib, start, end, char_desc_cb, NULL);
+	return;
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void cmd_read_hnd(int argcp, char **argvp)
@@ -477,18 +519,18 @@ static void cmd_read_hnd(int argcp, char **argvp)
 
 	if (conn_state != STATE_CONNECTED) {
 		printf("Command failed: disconnected\n");
-		return;
+		goto done;
 	}
 
 	if (argcp < 2) {
 		printf("Missing argument: handle\n");
-		return;
+		goto done;
 	}
 
 	handle = strtohandle(argvp[1]);
 	if (handle < 0) {
 		printf("Invalid handle: %s\n", argvp[1]);
-		return;
+		goto done;
 	}
 
 	if (argcp > 2) {
@@ -498,11 +540,16 @@ static void cmd_read_hnd(int argcp, char **argvp)
 		offset = strtol(argvp[2], &e, 0);
 		if (errno != 0 || *e != '\0') {
 			printf("Invalid offset: %s\n", argvp[2]);
-			return;
+			goto done;
 		}
 	}
 
 	gatt_read_char(attrib, handle, offset, char_read_cb, attrib);
+	return;
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void cmd_read_uuid(int argcp, char **argvp)
@@ -514,24 +561,24 @@ static void cmd_read_uuid(int argcp, char **argvp)
 
 	if (conn_state != STATE_CONNECTED) {
 		printf("Command failed: disconnected\n");
-		return;
+		goto done;
 	}
 
 	if (argcp < 2) {
 		printf("Missing argument: UUID\n");
-		return;
+		goto done;
 	}
 
 	if (bt_string_to_uuid(&uuid, argvp[1]) < 0) {
 		printf("Invalid UUID\n");
-		return;
+		goto done;
 	}
 
 	if (argcp > 2) {
 		start = strtohandle(argvp[2]);
 		if (start < 0) {
 			printf("Invalid start handle: %s\n", argvp[1]);
-			return;
+			goto done;
 		}
 	}
 
@@ -539,7 +586,7 @@ static void cmd_read_uuid(int argcp, char **argvp)
 		end = strtohandle(argvp[3]);
 		if (end < 0) {
 			printf("Invalid end handle: %s\n", argvp[2]);
-			return;
+			goto done;
 		}
 	}
 
@@ -551,6 +598,10 @@ static void cmd_read_uuid(int argcp, char **argvp)
 
 	gatt_read_char_by_uuid(attrib, start, end, &char_data->uuid,
 					char_read_by_uuid_cb, char_data);
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void char_write_req_cb(guint8 status, const guint8 *pdu, guint16 plen,
@@ -559,15 +610,19 @@ static void char_write_req_cb(guint8 status, const guint8 *pdu, guint16 plen,
 	if (status != 0) {
 		printf("Characteristic Write Request failed: "
 						"%s\n", att_ecode2str(status));
-		return;
+		goto done;
 	}
 
 	if (!dec_write_resp(pdu, plen)) {
 		printf("Protocol error\n");
-		return;
+		goto done;
 	}
 
 	printf("Characteristic value was written successfully\n");
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void cmd_char_write(int argcp, char **argvp)
@@ -578,24 +633,24 @@ static void cmd_char_write(int argcp, char **argvp)
 
 	if (conn_state != STATE_CONNECTED) {
 		printf("Command failed: disconnected\n");
-		return;
+		goto done;
 	}
 
 	if (argcp < 3) {
 		printf("Usage: %s <handle> <new value>\n", argvp[0]);
-		return;
+		goto done;
 	}
 
 	handle = strtoll(argvp[1], NULL, 16);
 	if (errno != 0 || handle <= 0) {
 		printf("A valid handle is required\n");
-		return;
+		goto done;
 	}
 
 	plen = gatt_attr_data_from_string(argvp[2], &value);
 	if (plen == 0) {
 		g_printerr("Invalid value\n");
-		return;
+		goto done;
 	}
 
 	if (g_strcmp0("char-write-req", argvp[0]) == 0)
@@ -605,6 +660,11 @@ static void cmd_char_write(int argcp, char **argvp)
 		gatt_write_char(attrib, handle, value, plen, NULL, NULL);
 
 	g_free(value);
+	return;
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void cmd_sec_level(int argcp, char **argvp)
@@ -614,7 +674,7 @@ static void cmd_sec_level(int argcp, char **argvp)
 
 	if (argcp < 2) {
 		printf("sec-level: %s\n", opt_sec_level);
-		return;
+		goto done;
 	}
 
 	if (strcasecmp(argvp[1], "medium") == 0)
@@ -625,18 +685,18 @@ static void cmd_sec_level(int argcp, char **argvp)
 		sec_level = BT_IO_SEC_LOW;
 	else {
 		printf("Allowed values: low | medium | high\n");
-		return;
+		goto done;
 	}
 
 	g_free(opt_sec_level);
 	opt_sec_level = g_strdup(argvp[1]);
 
 	if (conn_state != STATE_CONNECTED)
-		return;
+		goto done;
 
 	if (opt_psm) {
 		printf("It must be reconnected to this change take effect\n");
-		return;
+		goto done;
 	}
 
 	bt_io_set(iochannel, BT_IO_L2CAP, &gerr,
@@ -647,6 +707,11 @@ static void cmd_sec_level(int argcp, char **argvp)
 		printf("Error: %s\n", gerr->message);
 		g_error_free(gerr);
 	}
+	return;
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void exchange_mtu_cb(guint8 status, const guint8 *pdu, guint16 plen,
@@ -657,12 +722,12 @@ static void exchange_mtu_cb(guint8 status, const guint8 *pdu, guint16 plen,
 	if (status != 0) {
 		printf("Exchange MTU Request failed: %s\n",
 							att_ecode2str(status));
-		return;
+		goto done;
 	}
 
 	if (!dec_mtu_resp(pdu, plen, &mtu)) {
 		printf("Protocol error\n");
-		return;
+		goto done;
 	}
 
 	mtu = MIN(mtu, opt_mtu);
@@ -671,30 +736,34 @@ static void exchange_mtu_cb(guint8 status, const guint8 *pdu, guint16 plen,
 		printf("MTU was exchanged successfully: %d\n", mtu);
 	else
 		printf("Error exchanging MTU\n");
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static void cmd_mtu(int argcp, char **argvp)
 {
 	if (conn_state != STATE_CONNECTED) {
 		printf("Command failed: not connected.\n");
-		return;
+		goto done;
 	}
 
 	if (opt_psm) {
 		printf("Command failed: operation is only available for LE"
 							" transport.\n");
-		return;
+		goto done;
 	}
 
 	if (argcp < 2) {
 		printf("Usage: mtu <value>\n");
-		return;
+		goto done;
 	}
 
 	if (opt_mtu) {
 		printf("Command failed: MTU exchange can only occur once per"
 							" connection.\n");
-		return;
+		goto done;
 	}
 
 	errno = 0;
@@ -702,10 +771,15 @@ static void cmd_mtu(int argcp, char **argvp)
 	if (errno != 0 || opt_mtu < ATT_DEFAULT_LE_MTU) {
 		printf("Invalid value. Minimum MTU size is %d\n",
 							ATT_DEFAULT_LE_MTU);
-		return;
+		goto done;
 	}
 
 	gatt_exchange_mtu(attrib, opt_mtu, exchange_mtu_cb, NULL);
+	return;
+
+done:
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 }
 
 static struct {
@@ -740,7 +814,7 @@ static struct {
 		"Set security level. Default: low" },
 	{ "mtu",		cmd_mtu,	"<value>",
 		"Exchange MTU for GATT/ATT" },
-	{ NULL, NULL, NULL}
+	{ NULL, NULL, NULL, NULL}
 };
 
 static void cmd_help(int argcp, char **argvp)
@@ -750,11 +824,14 @@ static void cmd_help(int argcp, char **argvp)
 	for (i = 0; commands[i].cmd; i++)
 		printf("%-15s %-30s %s\n", commands[i].cmd,
 				commands[i].params, commands[i].desc);
+
+	printf("\n%s", get_prompt());
+	fflush(stdout);
 }
 
 static void parse_line(char *line_read)
 {
-	gchar **argvp;
+	gchar *argvp[10];
 	int argcp;
 	int i;
 
@@ -769,9 +846,18 @@ static void parse_line(char *line_read)
 	if (*line_read == '\0')
 		return;
 
-	add_history(line_read);
+	for (i = 0; i < 10; i++) {
+		if (*line_read) {
+			argvp[i] = line_read++;
+			while (*line_read && *line_read != ' ')
+				line_read++;
+			while (*line_read && *line_read == ' ')
+				*line_read++ = '\0';
+		} else
+			break;
+	}
 
-	g_shell_parse_argv(line_read, &argcp, &argvp, NULL);
+	argcp = i;
 
 	for (i = 0; commands[i].cmd; i++)
 		if (strcasecmp(commands[i].cmd, argvp[0]) == 0)
@@ -781,19 +867,61 @@ static void parse_line(char *line_read)
 		commands[i].func(argcp, argvp);
 	else
 		printf("%s: command not found\n", argvp[0]);
-
-	g_strfreev(argvp);
 }
 
 static gboolean prompt_read(GIOChannel *chan, GIOCondition cond,
 							gpointer user_data)
 {
+	gsize bytes_read;
+	GIOStatus status;
+	GError *err = NULL;
+	int i;
+
+
 	if (cond & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
 		g_io_channel_unref(chan);
 		return FALSE;
 	}
 
-	rl_callback_read_char();
+	while (cond & G_IO_IN) {
+		bytes_read = 0;
+		status = g_io_channel_read_chars(chan, &inp[didx], INPUT_SIZE - didx, &bytes_read, &err);
+		inp[didx + bytes_read] = '\0';
+		if (bytes_read && (status == G_IO_STATUS_NORMAL)) {
+			for (i = 0; (i < INPUT_SIZE) && (i < (didx + bytes_read)); i++) {
+				if (inp[i] == '\r' || inp[i] == '\n')
+					inp[i] = '\0';
+				if (!inp[i]) {
+					didx = i;
+					break;
+				}
+			}
+			if (inp[i] == '\0') {
+				if (didx) {
+					didx = 0;
+					parse_line(inp);
+				}
+				//printf("\r%s", get_prompt());
+				//fflush(stdout);
+				return TRUE;
+			} else if (didx < INPUT_SIZE) {
+				inp[didx] = '\0';
+				if (didx == INPUT_SIZE)
+					didx--;
+			} else {
+				/* Should never get here */
+				didx--;
+			}
+		} else if (err) {
+			printf("Error: %s\n", err->message);
+			break;
+		} else {
+			printf("IO Done\n");
+			break;
+		}
+	}
+	printf("Cond: %d\n", g_io_channel_get_buffer_condition(chan));
+
 
 	return TRUE;
 }
@@ -805,6 +933,7 @@ int interactive(const gchar *src, const gchar *dst, int psm)
 
 	opt_sec_level = g_strdup("low");
 
+	inp = g_malloc0(INPUT_SIZE + 1);
 	opt_src = g_strdup(src);
 	opt_dst = g_strdup(dst);
 	opt_psm = psm;
@@ -815,14 +944,15 @@ int interactive(const gchar *src, const gchar *dst, int psm)
 
 	pchan = g_io_channel_unix_new(fileno(stdin));
 	g_io_channel_set_close_on_unref(pchan, TRUE);
+	g_io_channel_set_encoding(pchan, NULL, NULL);
+	g_io_channel_set_buffered(pchan, FALSE);
 	events = G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL;
 	g_io_add_watch(pchan, events, prompt_read, NULL);
 
-	rl_callback_handler_install(get_prompt(), parse_line);
-
+	printf("\r%s", get_prompt());
+	fflush(stdout);
 	g_main_loop_run(event_loop);
 
-	rl_callback_handler_remove();
 	cmd_disconnect(0, NULL);
 	g_io_channel_unref(pchan);
 	g_main_loop_unref(event_loop);
@@ -831,6 +961,7 @@ int interactive(const gchar *src, const gchar *dst, int psm)
 	g_free(opt_src);
 	g_free(opt_dst);
 	g_free(opt_sec_level);
+	g_free(inp);
 
 	return 0;
 }

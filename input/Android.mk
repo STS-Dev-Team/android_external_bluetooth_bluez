@@ -21,6 +21,8 @@ LOCAL_C_INCLUDES:= \
 	$(LOCAL_PATH)/../lib \
 	$(LOCAL_PATH)/../src \
 	$(LOCAL_PATH)/../gdbus \
+	$(LOCAL_PATH)/../btio \
+	$(LOCAL_PATH)/../attrib \
 	$(call include-path-for, glib) \
 	$(call include-path-for, dbus)
 
@@ -32,6 +34,9 @@ LOCAL_SHARED_LIBRARIES := \
 	libdbus \
 	libexpat \
 	libglib 
+
+LOCAL_STATIC_LIBRARIES := \
+	libattrib_static
 
 LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/bluez-plugin
 LOCAL_UNSTRIPPED_PATH := $(TARGET_OUT_SHARED_LIBRARIES_UNSTRIPPED)/bluez-plugin

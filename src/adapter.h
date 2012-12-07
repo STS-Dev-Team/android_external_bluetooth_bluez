@@ -4,7 +4,7 @@
  *
  *  Copyright (C) 2006-2010  Nokia Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
- *
+ *  Copyright (C) 2010, Code Aurora Forum. All rights reserved
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -42,6 +42,13 @@
 #define STATE_RESOLVNAME	2
 #define STATE_SUSPENDED		3
 
+/* Supported host/controller discover type */
+#define DISC_LE			0x01
+#define DISC_STDINQ		0x02
+#define DISC_INTERLEAVE		0x04
+#define DISC_PINQ		0x08
+#define DISC_RESOLVNAME		0x10
+
 #define MAX_NAME_LENGTH		248
 
 /* Invalid SSP passkey value used to indicate negative replies */
@@ -52,22 +59,36 @@ typedef enum {
 	NAME_NOT_REQUIRED, /* used by get remote name without name resolving */
 	NAME_REQUIRED,      /* remote name needs be resolved       */
 	NAME_REQUESTED,    /* HCI remote name request was sent    */
+	NAME_SHORT,	/* Short name RXed in EIR */
 } name_status_t;
+
+typedef enum {
+	ADDR_TYPE_BREDR,
+	ADDR_TYPE_LE_PUBLIC,
+	ADDR_TYPE_LE_RANDOM,
+	ADDR_TYPE_UNKNOWN,
+} addr_type_t;
 
 struct btd_adapter;
 
 struct link_key_info {
 	bdaddr_t bdaddr;
+	uint8_t addr_type;
+	uint8_t key_type;
 	unsigned char key[16];
-	uint8_t type;
 	uint8_t pin_len;
+	uint8_t auth;
+	uint8_t dlen;
+	uint8_t data[];
 };
 
 struct remote_dev_info {
 	bdaddr_t bdaddr;
+	addr_type_t type;
 	int8_t rssi;
 	uint32_t class;
 	char *name;
+	char *deviceId;
 	char *alias;
 	dbus_bool_t legacy;
 	name_status_t name_status;
@@ -76,7 +97,7 @@ struct remote_dev_info {
 	size_t uuid_count;
 	GSList *services;
 	uint8_t bdaddr_type;
-	uint8_t flags;
+	int flags;
 };
 
 void btd_adapter_start(struct btd_adapter *adapter);
@@ -108,9 +129,15 @@ int adapter_get_state(struct btd_adapter *adapter);
 int adapter_get_discover_type(struct btd_adapter *adapter);
 struct remote_dev_info *adapter_search_found_devices(struct btd_adapter *adapter,
 						struct remote_dev_info *match);
+void adapter_update_device_from_info(struct btd_adapter *adapter,
+					bdaddr_t bdaddr, int8_t rssi,
+					const char *name, GSList *services,
+					int flags, const char *deviceId);
 void adapter_update_found_devices(struct btd_adapter *adapter, bdaddr_t *bdaddr,
-						uint32_t class, int8_t rssi,
-						uint8_t *data);
+			addr_type_t type, int8_t rssi, uint32_t class,
+			const char *name, const char *alias, gboolean legacy,
+			gboolean le, int flags, GSList *services,
+			name_status_t name_status, const char *deviceid);
 int adapter_remove_found_device(struct btd_adapter *adapter, bdaddr_t *bdaddr);
 void adapter_emit_device_found(struct btd_adapter *adapter,
 						struct remote_dev_info *dev);
@@ -118,6 +145,8 @@ void adapter_mode_changed(struct btd_adapter *adapter, uint8_t scan_mode);
 void adapter_update_local_name(struct btd_adapter *adapter, const char *name);
 void adapter_service_insert(struct btd_adapter *adapter, void *rec);
 void adapter_service_remove(struct btd_adapter *adapter, void *rec);
+int conn_get_pending_sec_level(struct btd_device *device, uint8_t *pending_sec_level);
+
 void btd_adapter_class_changed(struct btd_adapter *adapter,
 							uint32_t new_class);
 void btd_adapter_pairable_changed(struct btd_adapter *adapter,
@@ -125,7 +154,7 @@ void btd_adapter_pairable_changed(struct btd_adapter *adapter,
 
 struct agent *adapter_get_agent(struct btd_adapter *adapter);
 void adapter_add_connection(struct btd_adapter *adapter,
-						struct btd_device *device);
+					struct btd_device *device, uint8_t le);
 void adapter_remove_connection(struct btd_adapter *adapter,
 						struct btd_device *device);
 gboolean adapter_has_discov_sessions(struct btd_adapter *adapter);
@@ -212,6 +241,13 @@ struct btd_adapter_ops {
 	int (*remove_remote_oob_data) (int index, bdaddr_t *bdaddr);
 	int (*set_link_timeout) (int index, bdaddr_t *bdaddr, uint32_t num_slots);
 	int (*retry_authentication) (int index, bdaddr_t *bdaddr);
+	int (*set_connection_params) (int index, bdaddr_t *bdaddr,
+			uint16_t interval_min, uint16_t interval_max,
+			uint16_t slave_latency, uint16_t timeout_multiplier);
+	int (*set_rssi_reporter) (int index, bdaddr_t *bdaddr,
+			uint16_t rssi_threshold, uint16_t interval,
+			gboolean updateOnThreshExceed);
+	int (*unset_rssi_reporter) (int index, bdaddr_t *bdaddr);
 };
 
 int btd_register_adapter_ops(struct btd_adapter_ops *ops, gboolean priority);
@@ -271,3 +307,19 @@ int btd_adapter_add_remote_oob_data(struct btd_adapter *adapter,
 
 int btd_adapter_remove_remote_oob_data(struct btd_adapter *adapter,
 							bdaddr_t *bdaddr);
+
+int btd_adapter_set_connection_params(struct btd_adapter *adapter,
+		bdaddr_t *bdaddr, uint16_t interval_min, uint16_t interval_max,
+		uint16_t slave_latency, uint16_t timeout_multiplier);
+
+/* Used from the audio plug-in to update the streaming device
+ * This is information is used to enforce the master role to
+ * avoid audio choppy behaviour in case of A2DP + Scan case. */
+void update_streaming_device(struct btd_device *dev, gboolean streaming);
+
+int btd_adapter_register_rssi_watcher(struct btd_adapter *adapter,
+		bdaddr_t *bdaddr, int8_t rssi_threshold, uint16_t interval,
+		gboolean updateOnThreshExceed);
+
+int btd_adapter_unregister_rssi_watcher(struct btd_adapter *adapter,
+		bdaddr_t *bdaddr);

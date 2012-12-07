@@ -32,29 +32,27 @@ typedef enum {
 	AUTH_TYPE_CONFIRM,
 	AUTH_TYPE_NOTIFY,
 	AUTH_TYPE_AUTO,
+	AUTH_TYPE_OOB,
 	AUTH_TYPE_PAIRING_CONSENT,
 } auth_type_t;
 
-typedef enum {
-	DEVICE_TYPE_UNKNOWN,
-	DEVICE_TYPE_BREDR,
-	DEVICE_TYPE_LE,
-	DEVICE_TYPE_DUALMODE
-} device_type_t;
-
 struct btd_device *device_create(DBusConnection *conn,
 				struct btd_adapter *adapter,
-				const gchar *address, device_type_t type);
+				const gchar *address, addr_type_t type);
 void device_set_name(struct btd_device *device, const char *name);
 void device_get_name(struct btd_device *device, char *name, size_t len);
-device_type_t device_get_type(struct btd_device *device);
+uint32_t device_get_hash(struct btd_device *device);
+void device_set_hash(struct btd_device *device, uint32_t hash);
 void device_remove(struct btd_device *device, gboolean remove_stored);
 gint device_address_cmp(struct btd_device *device, const gchar *address);
+gint device_hash_cmp(struct btd_device *device, const gchar *hash);
 int device_browse_primary(struct btd_device *device, DBusConnection *conn,
 				DBusMessage *msg, gboolean secure);
 int device_browse_sdp(struct btd_device *device, DBusConnection *conn,
 			DBusMessage *msg, uuid_t *search, gboolean reverse);
 void device_probe_drivers(struct btd_device *device, GSList *profiles);
+int conn_get_pending_sec_level(struct btd_device *device, uint8_t *pending_sec_level);
+
 const sdp_record_t *btd_device_get_record(struct btd_device *device,
 						const char *uuid);
 GSList *btd_device_get_primaries(struct btd_device *device);
@@ -64,21 +62,25 @@ GSList *device_services_from_record(struct btd_device *device,
 							GSList *profiles);
 void btd_device_add_uuid(struct btd_device *device, const char *uuid);
 struct btd_adapter *device_get_adapter(struct btd_device *device);
-void device_get_address(struct btd_device *device, bdaddr_t *bdaddr);
+void device_get_address(struct btd_device *device, bdaddr_t *bdaddr,
+							addr_type_t *type);
 const gchar *device_get_path(struct btd_device *device);
 struct agent *device_get_agent(struct btd_device *device);
+gboolean device_is_bredr(struct btd_device *device);
+gboolean device_is_le(struct btd_device *device);
 gboolean device_is_busy(struct btd_device *device);
 gboolean device_is_temporary(struct btd_device *device);
 gboolean device_is_paired(struct btd_device *device);
 gboolean device_is_trusted(struct btd_device *device);
 void device_set_paired(struct btd_device *device, gboolean paired);
 void device_set_temporary(struct btd_device *device, gboolean temporary);
-void device_set_type(struct btd_device *device, device_type_t type);
 void device_set_bonded(struct btd_device *device, gboolean bonded);
 gboolean device_is_connected(struct btd_device *device);
 DBusMessage *device_create_bonding(struct btd_device *device,
 				DBusConnection *conn, DBusMessage *msg,
-				const char *agent_path, uint8_t capability);
+				const char *agent_path, uint8_t capability,
+				gboolean oob);
+char *device_type2text(addr_type_t type);
 void device_remove_bonding(struct btd_device *device);
 void device_bonding_complete(struct btd_device *device, uint8_t status);
 void device_simple_pairing_complete(struct btd_device *device, uint8_t status);
@@ -91,8 +93,11 @@ void device_cancel_authentication(struct btd_device *device, gboolean aborted);
 gboolean device_is_authenticating(struct btd_device *device);
 gboolean device_is_authorizing(struct btd_device *device);
 void device_set_authorizing(struct btd_device *device, gboolean auth);
-void device_add_connection(struct btd_device *device, DBusConnection *conn);
+void device_add_connection(struct btd_device *device, DBusConnection *conn,
+								uint8_t le);
 void device_remove_connection(struct btd_device *device, DBusConnection *conn);
+int device_get_handle(struct btd_device *device, int dd, uint16_t *handle);
+void device_update_rssi(struct btd_device *device, int8_t rssi);
 void device_request_disconnect(struct btd_device *device, DBusMessage *msg);
 
 typedef void (*disconnect_watch) (struct btd_device *device, gboolean removal,
@@ -118,3 +123,6 @@ void btd_unregister_device_driver(struct btd_device_driver *driver);
 
 struct btd_device *btd_device_ref(struct btd_device *device);
 void btd_device_unref(struct btd_device *device);
+int read_profile_version(struct btd_device *device, const char *pattern);
+int read_supported_feature_value(struct btd_device *device,
+		const char *pattern, uint16_t attrId);

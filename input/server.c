@@ -29,6 +29,7 @@
 #include <errno.h>
 
 #include <bluetooth/bluetooth.h>
+#include <bluetooth/uuid.h>
 #include <bluetooth/sdp.h>
 
 #include <glib.h>
@@ -42,12 +43,15 @@
 #include "device.h"
 #include "server.h"
 
+#define ATT_CID		4
+
 static GSList *servers = NULL;
 struct input_server {
 	bdaddr_t src;
 	GIOChannel *ctrl;
 	GIOChannel *intr;
 	GIOChannel *confirm;
+	GIOChannel *att;
 };
 
 static gint server_cmp(gconstpointer s, gconstpointer user_data)
@@ -97,6 +101,36 @@ static void connect_event_cb(GIOChannel *chan, GError *err, gpointer data)
 	}
 
 	g_io_channel_shutdown(chan, TRUE, NULL);
+}
+
+static void connect_att_event_cb(GIOChannel *chan, GError *err, gpointer data)
+{
+	uint16_t cid;
+	bdaddr_t src, dst;
+	GError *gerr = NULL;
+	int ret;
+
+	if (err) {
+		error("%s", err->message);
+		return;
+	}
+
+	bt_io_get(chan, BT_IO_L2CAP, &gerr,
+			BT_IO_OPT_SOURCE_BDADDR, &src,
+			BT_IO_OPT_DEST_BDADDR, &dst,
+			BT_IO_OPT_CID, &cid,
+			BT_IO_OPT_INVALID);
+	if (gerr) {
+		error("%s", gerr->message);
+		g_error_free(gerr);
+		g_io_channel_shutdown(chan, TRUE, NULL);
+		return;
+	}
+
+	DBG("Incoming HID LE connection on GATT CID %d", cid);
+	ret = input_device_set_channel(&src, &dst, cid, chan);
+	if (ret)
+		error("Error %d", ret);
 }
 
 static void auth_callback(DBusError *derr, void *user_data)
@@ -184,7 +218,7 @@ int server_start(const bdaddr_t *src)
 	server = g_new0(struct input_server, 1);
 	bacpy(&server->src, src);
 
-	server->ctrl = bt_io_listen(BT_IO_L2CAP, connect_event_cb, NULL,
+	server->ctrl = bt_io_listen(BT_IO_L2CAP, NULL, confirm_event_cb,
 				server, NULL, &err,
 				BT_IO_OPT_SOURCE_BDADDR, src,
 				BT_IO_OPT_PSM, L2CAP_PSM_HIDP_CTRL,
@@ -198,7 +232,7 @@ int server_start(const bdaddr_t *src)
 		return -1;
 	}
 
-	server->intr = bt_io_listen(BT_IO_L2CAP, NULL, confirm_event_cb,
+	server->intr = bt_io_listen(BT_IO_L2CAP, connect_event_cb, NULL,
 				server, NULL, &err,
 				BT_IO_OPT_SOURCE_BDADDR, src,
 				BT_IO_OPT_PSM, L2CAP_PSM_HIDP_INTR,
@@ -211,6 +245,19 @@ int server_start(const bdaddr_t *src)
 		g_error_free(err);
 		g_free(server);
 		return -1;
+	}
+
+	server->att = bt_io_listen(BT_IO_L2CAP, NULL, connect_att_event_cb,
+					server, NULL, &err,
+					BT_IO_OPT_SOURCE_BDADDR, BDADDR_ANY,
+					BT_IO_OPT_CID, ATT_CID,
+					BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_LOW,
+					BT_IO_OPT_POWER_ACTIVE, 0,
+					BT_IO_OPT_INVALID);
+	if (!server->att) {
+		error("%s Failed to listen on GATT channel", err->message);
+		g_error_free(err);
+		//Just continue, do not return error(-1) as HIDLE is not supported
 	}
 
 	servers = g_slist_append(servers, server);
@@ -234,6 +281,9 @@ void server_stop(const bdaddr_t *src)
 
 	g_io_channel_shutdown(server->ctrl, TRUE, NULL);
 	g_io_channel_unref(server->ctrl);
+
+	g_io_channel_shutdown(server->att, TRUE, NULL);
+	g_io_channel_unref(server->att);
 
 	servers = g_slist_remove(servers, server);
 	g_free(server);

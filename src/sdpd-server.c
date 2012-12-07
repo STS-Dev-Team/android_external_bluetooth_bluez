@@ -34,7 +34,10 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+
+#ifdef ANDROID
 #include <cutils/sockets.h>
+#endif
 
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/l2cap.h>
@@ -123,7 +126,7 @@ static int init_server(uint16_t mtu, int master, int compat)
 		unix_sock = -1;
 		return 0;
 	}
-#if 0
+#ifndef ANDROID
         /* Create local Unix socket */
         unix_sock = socket(PF_UNIX, SOCK_STREAM, 0);
         if (unix_sock < 0) {
@@ -253,17 +256,31 @@ int start_sdp_server(uint16_t mtu, const char *did, uint32_t flags)
 
 	if (did && strlen(did) > 0) {
 		const char *ptr = did;
-		uint16_t vid = 0x0000, pid = 0x0000, ver = 0x0000;
+		uint16_t spec_id = 0x0000, vid = 0x0000, pid = 0x0000;
+		uint16_t ver = 0x0000, vensrc_id = 0x0000;
+		uint8_t primary_record = 0;
 
-		vid = (uint16_t) strtol(ptr, NULL, 16);
+		spec_id = (uint16_t) strtol(ptr, NULL, 16);
 		ptr = strchr(ptr, ':');
 		if (ptr) {
-			pid = (uint16_t) strtol(ptr + 1, NULL, 16);
+			vid = (uint16_t) strtol(ptr + 1, NULL, 16);
 			ptr = strchr(ptr + 1, ':');
-			if (ptr)
-				ver = (uint16_t) strtol(ptr + 1, NULL, 16);
-			register_device_id(vid, pid, ver);
+			if (ptr) {
+				pid= (uint16_t) strtol(ptr + 1, NULL, 16);
+				ptr = strchr(ptr + 1, ':');
+				if (ptr) {
+					ver = (uint16_t) strtol(ptr + 1, NULL, 16);
+					ptr = strchr(ptr + 1, ':');
+					if (ptr) {
+						primary_record = (uint8_t) strtol(ptr + 1, NULL, 16);
+						ptr = strchr(ptr + 1, ':');
+						if (ptr)
+							vensrc_id = (uint16_t) strtol(ptr + 1, NULL, 16);
+                                                }
+                                        }
+                               }
 		}
+		register_device_id(spec_id, vid, pid, ver, primary_record, vensrc_id);
 	}
 
 	io = g_io_channel_unix_new(l2cap_sock);

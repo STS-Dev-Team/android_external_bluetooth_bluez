@@ -1080,6 +1080,36 @@ int hci_send_cmd(int dd, uint16_t ogf, uint16_t ocf, uint8_t plen, void *param)
 	return 0;
 }
 
+int hci_send_data(int dd, uint16_t handle, uint8_t flags, uint16_t dlen, void *data)
+{
+	uint8_t type = HCI_ACLDATA_PKT;
+	hci_acl_hdr hd;
+	struct iovec iv[3];
+	int ivn;
+
+	hd.handle = htobs(acl_handle_pack(handle, flags));
+	hd.dlen = dlen;
+
+	iv[0].iov_base = &type;
+	iv[0].iov_len  = 1;
+	iv[1].iov_base = &hd;
+	iv[1].iov_len  = HCI_COMMAND_HDR_SIZE;
+	ivn = 2;
+
+	if (dlen) {
+		iv[2].iov_base = data;
+		iv[2].iov_len  = dlen;
+		ivn = 3;
+	}
+
+	while (writev(dd, iv, ivn) < 0) {
+		if (errno == EAGAIN || errno == EINTR)
+			continue;
+		return -1;
+	}
+	return 0;
+}
+
 int hci_send_req(int dd, struct hci_request *r, int to)
 {
 	unsigned char buf[HCI_MAX_EVENT_SIZE], *ptr;
@@ -2085,7 +2115,6 @@ int hci_park_mode(int dd, uint16_t handle, uint16_t max_interval,
 		errno = EIO;
 		return -1;
 	}
-
 	return 0;
 }
 

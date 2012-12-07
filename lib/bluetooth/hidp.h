@@ -42,20 +42,29 @@ extern "C" {
 #define HIDP_BOOT_PROTOCOL_MODE		1
 #define HIDP_BLUETOOTH_VENDOR_ID	9
 
+struct reference_desc {
+	uint16_t	chr_hndl;
+	uint8_t		rep_id;
+	uint8_t		rep_type;
+};
+
 struct hidp_connadd_req {
 	int ctrl_sock;		/* Connected control socket */
 	int intr_sock;		/* Connected interrupt socket */
+	int att_sock;		/* Connected attribute socket */
 	uint16_t parser;	/* Parser version */
 	uint16_t rd_size;	/* Report descriptor size */
 	uint8_t *rd_data;	/* Report descriptor data */
 	uint8_t  country;
 	uint8_t  subclass;
+	uint8_t  rrd_cnt;
 	uint16_t vendor;
 	uint16_t product;
 	uint16_t version;
 	uint32_t flags;
 	uint32_t idle_to;
 	char name[128];		/* Device name */
+	struct reference_desc *rrd_data;	/* Reference descriptor data */
 };
 
 struct hidp_conndel_req {

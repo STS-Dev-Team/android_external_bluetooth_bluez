@@ -35,7 +35,7 @@
 
 #include <bluetooth/sdp.h>
 #include <bluetooth/sdp_lib.h>
-
+#include <glib.h>
 #include "sdp-xml.h"
 
 #define STRBUFSIZE 1024
@@ -305,7 +305,19 @@ static void convert_raw_data_to_xml(sdp_data_t *value, int indent_level,
 
 			strBuf[j] = '\0';
 		}
+		/* validation for non utf8 characters and remove them */
+		if (!g_utf8_validate(strBuf, -1, NULL)) {
+			int i;
 
+			/* Assume ASCII, and replace all non-ASCII with
+			 * spaces */
+			for (i = 0; strBuf[i] != '\0'; i++) {
+				if (!isascii(strBuf[i]))
+					strBuf[i] = ' ';
+			}
+			/* Remove leading and trailing whitespace characters */
+			g_strstrip(strBuf);
+		}
 		appender(data, "value=\"");
 		appender(data, strBuf);
 		appender(data, "\" />\n");

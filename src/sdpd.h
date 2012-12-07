@@ -6,6 +6,7 @@
  *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
  *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
  *  Copyright (C) 2002-2003  Stephen Crane <steve.crane@rococosoft.com>
+ *  Copyright (C) 2010, Code Aurora Forum. All rights reserved
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -34,6 +35,21 @@
 #define SDPDBG(fmt...)
 #endif
 
+#define EIR_DATA_LENGTH  240
+
+#define EIR_FLAGS                   0x01  /* flags */
+#define EIR_UUID16_SOME             0x02  /* 16-bit UUID, more available */
+#define EIR_UUID16_ALL              0x03  /* 16-bit UUID, all listed */
+#define EIR_UUID32_SOME             0x04  /* 32-bit UUID, more available */
+#define EIR_UUID32_ALL              0x05  /* 32-bit UUID, all listed */
+#define EIR_UUID128_SOME            0x06  /* 128-bit UUID, more available */
+#define EIR_UUID128_ALL             0x07  /* 128-bit UUID, all listed */
+#define EIR_NAME_SHORT              0x08  /* shortened local name */
+#define EIR_NAME_COMPLETE           0x09  /* complete local name */
+#define EIR_TX_POWER                0x0A  /* transmit power level */
+#define EIR_DEVICE_ID               0x10  /* device ID */
+#define EIR_GAP_APPEARANCE		0x19  /* GAP appearance */
+
 typedef struct request {
 	bdaddr_t device;
 	bdaddr_t bdaddr;
@@ -53,8 +69,11 @@ int service_remove_req(sdp_req_t *req, sdp_buf_t *rsp);
 
 void register_public_browse_group(void);
 void register_server_service(void);
-void register_device_id(const uint16_t vendor, const uint16_t product,
-						const uint16_t version);
+void register_device_id(const uint16_t spec, const uint16_t vendor,
+						const uint16_t product, const uint16_t version,
+						const uint8_t primary, const uint16_t source);
+
+
 
 int record_sort(const void *r1, const void *r2);
 void sdp_svcdb_reset(void);
@@ -81,4 +100,6 @@ int add_record_to_server(const bdaddr_t *src, sdp_record_t *rec);
 int remove_record_from_server(uint32_t handle);
 
 void sdp_init_services_list(bdaddr_t *device);
+#ifdef ANDROID
 static inline int android_get_control_socket(const char *name);
+#endif

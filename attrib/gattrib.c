@@ -31,11 +31,10 @@
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/uuid.h>
 
+#include "log.h"
 #include "att.h"
 #include "btio.h"
 #include "gattrib.h"
-
-#define GATT_TIMEOUT 30
 
 struct _GAttrib {
 	GIOChannel *io;
@@ -51,8 +50,10 @@ struct _GAttrib {
 	guint next_evt_id;
 	GDestroyNotify destroy;
 	GAttribDisconnectFunc disconnect;
+	GAttribDisconnectFunc disconnect_server;
 	gpointer destroy_user_data;
 	gpointer disc_user_data;
+	gpointer disc_server_data;
 };
 
 struct command {
@@ -222,6 +223,18 @@ GIOChannel *g_attrib_get_channel(GAttrib *attrib)
 	return attrib->io;
 }
 
+gboolean g_attrib_set_disconnect_server_function(GAttrib *attrib,
+		GAttribDisconnectFunc disconnect, gpointer user_data)
+{
+	if (attrib == NULL)
+		return FALSE;
+
+	attrib->disconnect_server = disconnect;
+	attrib->disc_server_data = user_data;
+
+	return TRUE;
+}
+
 gboolean g_attrib_set_disconnect_function(GAttrib *attrib,
 		GAttribDisconnectFunc disconnect, gpointer user_data)
 {
@@ -265,6 +278,9 @@ static gboolean can_write_data(GIOChannel *io, GIOCondition cond,
 	GIOStatus iostat;
 
 	if (cond & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
+		if (attrib->disconnect_server)
+			attrib->disconnect_server(attrib->disc_server_data);
+
 		if (attrib->disconnect)
 			attrib->disconnect(attrib->disc_user_data);
 
@@ -321,15 +337,16 @@ static gboolean received_data(GIOChannel *io, GIOCondition cond, gpointer data)
 	GIOStatus iostat;
 	gboolean qempty;
 
-	if (attrib->timeout_watch > 0) {
-		g_source_remove(attrib->timeout_watch);
-		attrib->timeout_watch = 0;
-	}
+	DBG(" io: %p, cond: %d, data: %p", io, cond, data);
 
 	if (cond & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
 		attrib->read_watch = 0;
+		if (attrib->disconnect_server)
+			attrib->disconnect_server(attrib->disc_server_data);
+
 		if (attrib->disconnect)
 			attrib->disconnect(attrib->disc_user_data);
+
 		return FALSE;
 	}
 
@@ -337,6 +354,12 @@ static gboolean received_data(GIOChannel *io, GIOCondition cond, gpointer data)
 
 	iostat = g_io_channel_read_chars(io, (gchar *) buf, sizeof(buf),
 								&len, NULL);
+
+	if (attrib->timeout_watch > 0 && is_response(buf[0]) == TRUE) {
+		g_source_remove(attrib->timeout_watch);
+		attrib->timeout_watch = 0;
+	}
+
 	if (iostat != G_IO_STATUS_NORMAL) {
 		status = ATT_ECODE_IO;
 		goto done;
@@ -346,13 +369,39 @@ static gboolean received_data(GIOChannel *io, GIOCondition cond, gpointer data)
 		struct event *evt = l->data;
 
 		if (evt->expected == buf[0] ||
-					evt->expected == GATTRIB_ALL_EVENTS)
+			evt->expected == GATTRIB_ALL_EVENTS ||
+			(evt->expected == GATTRIB_ALL_REQS && !(buf[0] & 1)))
 			evt->func(buf, len, evt->user_data);
 	}
 
 	if (is_response(buf[0]) == FALSE)
 		return TRUE;
 
+	/* Auto-elevate security if remote device complains */
+	if (buf[0] == ATT_OP_ERROR && (buf[4] == ATT_ECODE_INSUFF_ENC ||
+					buf[4] == ATT_ECODE_AUTHENTICATION)) {
+		BtIOSecLevel sec_level = BT_IO_SEC_LOW;
+
+		bt_io_get(io, BT_IO_L2CAP, NULL,
+			BT_IO_OPT_SEC_LEVEL, &sec_level,
+			BT_IO_OPT_INVALID);
+
+		/* If already at high, give up and process as normal */
+		if (sec_level == BT_IO_SEC_HIGH)
+			goto process_response;
+		else if (sec_level < BT_IO_SEC_MEDIUM)
+			sec_level = BT_IO_SEC_MEDIUM;
+		else
+			sec_level = BT_IO_SEC_HIGH;
+
+		if (bt_io_set(io, BT_IO_L2CAP, NULL,
+				BT_IO_OPT_SEC_LEVEL, sec_level,
+				BT_IO_OPT_INVALID)) {
+			goto done;
+		}
+	}
+
+process_response:
 	cmd = g_queue_pop_head(attrib->queue);
 	if (cmd == NULL) {
 		/* Keep the watch if we have events to report */
@@ -390,7 +439,8 @@ done:
 GAttrib *g_attrib_new(GIOChannel *io)
 {
 	struct _GAttrib *attrib;
-	uint16_t omtu;
+	uint16_t omtu, cid;
+	bdaddr_t src, dst;
 
 	g_io_channel_set_encoding(io, NULL, NULL);
 	g_io_channel_set_buffered(io, FALSE);
@@ -408,10 +458,18 @@ GAttrib *g_attrib_new(GIOChannel *io)
 
 	if (bt_io_get(attrib->io, BT_IO_L2CAP, NULL,
 			BT_IO_OPT_OMTU, &omtu,
+			BT_IO_OPT_CID, &cid,
+			BT_IO_OPT_SOURCE_BDADDR, &src,
+			BT_IO_OPT_DEST_BDADDR, &dst,
 			BT_IO_OPT_INVALID)) {
 		if (omtu == 0 || omtu > ATT_MAX_MTU)
 			omtu = ATT_MAX_MTU;
 	} else
+		omtu = ATT_DEFAULT_LE_MTU;
+
+	DBG(" cid %d mtu %d", cid, omtu);
+
+	if (cid == ATT_CID)
 		omtu = ATT_DEFAULT_LE_MTU;
 
 	attrib->buf = g_malloc0(omtu);
@@ -567,6 +625,9 @@ guint g_attrib_register(GAttrib *attrib, guint8 opcode,
 	event->id = ++attrib->next_evt_id;
 
 	attrib->events = g_slist_append(attrib->events, event);
+
+	DBG(" attrib %p events %p event: %p - opcode %d - func %p id %d",
+		attrib, attrib->events, event, opcode, func, event->id);
 
 	return event->id;
 }

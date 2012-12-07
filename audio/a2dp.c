@@ -4,6 +4,7 @@
  *
  *  Copyright (C) 2006-2010  Nokia Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2010, Code Aurora Forum. All rights reserved.
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -41,17 +42,23 @@
 #include "manager.h"
 #include "avdtp.h"
 #include "sink.h"
+#include "control.h"
 #include "source.h"
 #include "unix.h"
 #include "media.h"
 #include "transport.h"
 #include "a2dp.h"
 #include "sdpd.h"
-
+#include "../src/adapter.h"
+#include "../src/device.h"
+#include "storage.h"
 /* The duration that streams without users are allowed to stay in
  * STREAMING state. */
 #define SUSPEND_TIMEOUT 5
 #define RECONFIGURE_TIMEOUT 500
+
+/* Content protection types */
+#define CP_TYPE_SCMS_T 0x0002
 
 #ifndef MIN
 # define MIN(x, y) ((x) < (y) ? (x) : (y))
@@ -60,6 +67,16 @@
 #ifndef MAX
 # define MAX(x, y) ((x) > (y) ? (x) : (y))
 #endif
+
+#define EDR_ACL_2_MBPS_MASK 0x02
+#define EDR_ACL_3_MBPS_MASK 0x04
+#define _3_SLOT_EDR_ACL_MASK 0x80
+#define _5_SLOT_EDR_ACL_MASK 0x01
+
+#define EDR_ACL_2_MBPS_BYTE 0x03
+#define EDR_ACL_3_MBPS_BYTE 0x03
+#define _3_SLOT_EDR_ACL_BYTE 0x04
+#define _5_SLOT_EDR_ACL_BYTE 0x05
 
 struct a2dp_sep {
 	struct a2dp_server *server;
@@ -74,6 +91,7 @@ struct a2dp_sep {
 	gboolean locked;
 	gboolean suspending;
 	gboolean starting;
+	gboolean remote_suspend;
 };
 
 struct a2dp_setup_cb {
@@ -113,6 +131,7 @@ struct a2dp_server {
 	uint16_t version;
 	gboolean sink_enabled;
 	gboolean source_enabled;
+	gboolean sbc_quality_high;
 };
 
 static GSList *servers = NULL;
@@ -164,9 +183,11 @@ static void setup_free(struct a2dp_setup *s)
 	if (s->session)
 		avdtp_unref(s->session);
 	g_slist_foreach(s->cb, (GFunc) g_free, NULL);
-	g_slist_free(s->cb);
+	if (s->cb)
+		g_slist_free(s->cb);
 	g_slist_foreach(s->caps, (GFunc) g_free, NULL);
-	g_slist_free(s->caps);
+	if (s->caps)
+		g_slist_free(s->caps);
 	g_free(s);
 }
 
@@ -485,6 +506,8 @@ static gboolean sbc_getcap_ind(struct avdtp *session, struct avdtp_local_sep *se
 {
 	struct a2dp_sep *a2dp_sep = user_data;
 	struct avdtp_service_capability *media_transport, *media_codec;
+	struct avdtp_service_capability *media_scms_t;
+	struct avdtp_content_protection_capability scms_t_cap;
 	struct sbc_codec_cap sbc_cap;
 
 	if (a2dp_sep->type == AVDTP_SEP_TYPE_SINK)
@@ -542,6 +565,13 @@ static gboolean sbc_getcap_ind(struct avdtp *session, struct avdtp_local_sep *se
 								NULL, 0);
 		*caps = g_slist_append(*caps, delay_reporting);
 	}
+	memset(&scms_t_cap, 0, sizeof(scms_t_cap));
+	scms_t_cap.cp_type_lsb = (CP_TYPE_SCMS_T & 0xFF);
+	scms_t_cap.cp_type_msb = (CP_TYPE_SCMS_T >> 8) & 0xFF;
+	media_scms_t = avdtp_service_cap_new(AVDTP_CONTENT_PROTECTION,
+						&scms_t_cap, 2);
+
+	*caps = g_slist_append(*caps, media_scms_t);
 
 	return TRUE;
 }
@@ -587,6 +617,149 @@ done:
 	return TRUE;
 }
 
+
+#ifdef ENABLE_CSR_APTX_CODEC
+/*
+ * APTX Functions definitions to set configuration
+ * static gboolean aptx_setconf_ind() and aptx_getcap_ind()
+ */
+static gboolean btaptx_setconf_ind(struct avdtp *session,
+				struct avdtp_local_sep *sep,
+				struct avdtp_stream *stream,
+				GSList *caps,
+				avdtp_set_configuration_cb cb,
+				void *user_data)
+{
+	struct a2dp_sep *a2dp_sep = user_data;
+	struct a2dp_setup *setup;
+
+	if (a2dp_sep->type == AVDTP_SEP_TYPE_SINK)
+		DBG("Sink %p: Set_Configuration_Ind", sep);
+	else
+		DBG("Source %p: Set_Configuration_Ind", sep);
+
+	setup = a2dp_setup_get(session);
+	if (!setup)
+	return FALSE;
+
+	a2dp_sep->stream = stream;
+	setup->sep = a2dp_sep;
+	setup->stream = stream;
+	setup->setconf_cb = cb;
+
+	/* Check valid settings */
+	for (; caps != NULL; caps = g_slist_next(caps)) {
+		struct avdtp_service_capability *cap = caps->data;
+		struct avdtp_media_codec_capability *codec_cap;
+		struct btaptx_codec_cap *btaptx_cap;
+
+		if (cap->category == AVDTP_DELAY_REPORTING &&
+				!a2dp_sep->delay_reporting) {
+			setup->err = g_new(struct avdtp_error, 1);
+			avdtp_error_init(setup->err, AVDTP_DELAY_REPORTING,
+					AVDTP_UNSUPPORTED_CONFIGURATION);
+			goto done;
+		}
+
+		if (cap->category != AVDTP_MEDIA_CODEC)
+			continue;
+
+		if (cap->length < sizeof(struct btaptx_codec_cap))
+			continue;
+
+		codec_cap = (void *) cap->data;
+
+		if (codec_cap->media_codec_type != NON_A2DP_CODEC_BTAPTX)
+			continue;
+
+		DBG("rfa0:4=%u\n",codec_cap->rfa0);
+		DBG("media_type:4=%u\n",codec_cap->media_type);
+		DBG("media_codec_type=%u\n",codec_cap->media_codec_type);
+		DBG("data[0]=%u\n",codec_cap->data);
+
+		btaptx_cap = (void *) codec_cap;
+
+		//Checking more strictly the braptx codec with IDs and codec type.
+		if (btaptx_cap->vender_id0 != BTAPTX_VENDER_ID0
+			||btaptx_cap->vender_id1 != BTAPTX_VENDER_ID1
+			||btaptx_cap->vender_id2 != BTAPTX_VENDER_ID2
+			||btaptx_cap->vender_id3 != BTAPTX_VENDER_ID3
+			||btaptx_cap->codec_id0 != BTAPTX_CODEC_ID0
+			||btaptx_cap->codec_id1 != BTAPTX_CODEC_ID1
+			||btaptx_cap->cap.media_codec_type != NON_A2DP_CODEC_BTAPTX)
+		{
+			setup->err = g_new(struct avdtp_error, 1);
+			avdtp_error_init(setup->err, AVDTP_MEDIA_CODEC,
+					AVDTP_UNSUPPORTED_CONFIGURATION);
+		}
+                else
+		{
+			goto done;
+		}
+	}
+
+	done:
+	g_idle_add(auto_config, setup);
+
+	return TRUE;
+}
+
+static gboolean btaptx_getcap_ind(struct avdtp *session, struct avdtp_local_sep *sep,
+				gboolean get_all,
+				GSList **caps, uint8_t *err, void *user_data)
+{
+	struct a2dp_sep *a2dp_sep = user_data;
+	struct avdtp_service_capability *media_transport, *media_codec;
+	struct btaptx_codec_cap btaptx_cap;
+
+	if (a2dp_sep->type == AVDTP_SEP_TYPE_SINK)
+		DBG("Sink %p: Get_Capability_Ind", sep);
+	else
+		DBG("Source %p: Get_Capability_Ind", sep);
+
+	*caps = NULL;
+
+	media_transport = avdtp_service_cap_new(AVDTP_MEDIA_TRANSPORT,
+						NULL, 0);
+
+	*caps = g_slist_append(*caps, media_transport);
+
+	memset(&btaptx_cap, 0, sizeof(struct btaptx_codec_cap));
+
+	btaptx_cap.cap.media_type = AVDTP_MEDIA_TYPE_AUDIO;
+	btaptx_cap.cap.media_codec_type = NON_A2DP_CODEC_BTAPTX;
+
+#ifdef ANDROID
+	btaptx_cap.frequency = BTAPTX_SAMPLING_FREQ_44100;
+	btaptx_cap.channel_mode = BTAPTX_CHANNEL_MODE_STEREO;
+#else
+	btaptx_cap.frequency_channel_mode = (BTAPTX_SAMPLING_FREQ_48000 +
+		BTAPTX_SAMPLING_FREQ_44100 + BTAPTX_SAMPLING_FREQ_32000 +
+		BTAPTX_SAMPLING_FREQ_16000 + BTAPTX_CHANNEL_MODE_STEREO );
+#endif
+	btaptx_cap.vender_id0 = BTAPTX_VENDER_ID0;
+	btaptx_cap.vender_id1 = BTAPTX_VENDER_ID1;
+	btaptx_cap.vender_id2 = BTAPTX_VENDER_ID2;
+	btaptx_cap.vender_id3 = BTAPTX_VENDER_ID3;
+
+	btaptx_cap.codec_id0 =  BTAPTX_CODEC_ID0;
+	btaptx_cap.codec_id1 =  BTAPTX_CODEC_ID1;
+
+	media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, &btaptx_cap,
+						sizeof(btaptx_cap));
+
+	*caps = g_slist_append(*caps, media_codec);
+
+	if (get_all) {
+		struct avdtp_service_capability *delay_reporting;
+		delay_reporting = avdtp_service_cap_new(AVDTP_DELAY_REPORTING,
+								NULL, 0);
+		*caps = g_slist_append(*caps, delay_reporting);
+	}
+	return TRUE;
+}
+#endif //ENABLE_CSR_APTX_CODEC
+
 static gboolean mpeg_getcap_ind(struct avdtp *session,
 				struct avdtp_local_sep *sep,
 				gboolean get_all,
@@ -594,6 +767,8 @@ static gboolean mpeg_getcap_ind(struct avdtp *session,
 {
 	struct a2dp_sep *a2dp_sep = user_data;
 	struct avdtp_service_capability *media_transport, *media_codec;
+	struct avdtp_service_capability *media_scms_t;
+	struct avdtp_content_protection_capability scms_t_cap;
 	struct mpeg_codec_cap mpeg_cap;
 
 	if (a2dp_sep->type == AVDTP_SEP_TYPE_SINK)
@@ -640,6 +815,13 @@ static gboolean mpeg_getcap_ind(struct avdtp *session,
 								NULL, 0);
 		*caps = g_slist_append(*caps, delay_reporting);
 	}
+	memset(&scms_t_cap, 0, sizeof(scms_t_cap));
+	scms_t_cap.cp_type_lsb = (CP_TYPE_SCMS_T & 0xFF);
+	scms_t_cap.cp_type_msb = (CP_TYPE_SCMS_T >> 8) & 0xFF;
+	media_scms_t = avdtp_service_cap_new(AVDTP_CONTENT_PROTECTION,
+						&scms_t_cap, 2);
+
+	*caps = g_slist_append(*caps, media_scms_t);
 
 	return TRUE;
 }
@@ -941,6 +1123,7 @@ static gboolean start_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 {
 	struct a2dp_sep *a2dp_sep = user_data;
 	struct a2dp_setup *setup;
+	struct audio_device *dev;
 
 	if (a2dp_sep->type == AVDTP_SEP_TYPE_SINK)
 		DBG("Sink %p: Start_Ind", sep);
@@ -956,6 +1139,14 @@ static gboolean start_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 		a2dp_sep->suspend_timer = g_timeout_add_seconds(SUSPEND_TIMEOUT,
 						(GSourceFunc) suspend_timeout,
 						a2dp_sep);
+	}
+
+	if (a2dp_sep->remote_suspend) {
+		dev = a2dp_get_dev(session);
+		DBG("dev value is %p: ", dev);
+		if (dev)
+			control_resume(dev);
+		a2dp_sep->remote_suspend = FALSE;
 	}
 
 	return TRUE;
@@ -981,7 +1172,7 @@ static void start_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 		setup->stream = NULL;
 		setup->err = err;
 	}
-
+	a2dp_sep->remote_suspend = FALSE;
 	finalize_resume(setup);
 }
 
@@ -990,6 +1181,7 @@ static gboolean suspend_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 				void *user_data)
 {
 	struct a2dp_sep *a2dp_sep = user_data;
+	struct audio_device *dev;
 
 	if (a2dp_sep->type == AVDTP_SEP_TYPE_SINK)
 		DBG("Sink %p: Suspend_Ind", sep);
@@ -1001,6 +1193,19 @@ static gboolean suspend_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 		a2dp_sep->suspend_timer = 0;
 		avdtp_unref(a2dp_sep->session);
 		a2dp_sep->session = NULL;
+	}
+
+	dev = a2dp_get_dev(session);
+	DBG("dev value is %p: ", dev);
+	if (dev) {
+		uint8_t match = 0;
+		bdaddr_t dst;
+		avdtp_get_peers(session, NULL, &dst);
+		read_special_map_devaddr("remote_suspend", &dst, &match);
+		if (!match) {
+			control_suspend(dev);
+			a2dp_sep->remote_suspend = TRUE;
+		}
 	}
 
 	return TRUE;
@@ -1067,6 +1272,8 @@ static gboolean close_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 	if (!setup)
 		return TRUE;
 
+	a2dp_sep->remote_suspend = FALSE;
+
 	finalize_setup_errno(setup, -ECONNRESET, finalize_suspend,
 							finalize_resume, NULL);
 
@@ -1121,6 +1328,8 @@ static void close_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 	if (!setup)
 		return;
 
+	a2dp_sep->remote_suspend = FALSE;
+
 	if (err) {
 		setup->stream = NULL;
 		setup->err = err;
@@ -1146,6 +1355,7 @@ static gboolean abort_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 	else
 		DBG("Source %p: Abort_Ind", sep);
 
+	a2dp_sep->remote_suspend = FALSE;
 	a2dp_sep->stream = NULL;
 
 	return TRUE;
@@ -1167,6 +1377,7 @@ static void abort_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 	if (!setup)
 		return;
 
+	a2dp_sep->remote_suspend = FALSE;
 	setup_unref(setup);
 }
 
@@ -1310,6 +1521,23 @@ static struct avdtp_sep_ind endpoint_ind = {
 	.delayreport		= endpoint_delayreport_ind,
 };
 
+#ifdef ENABLE_CSR_APTX_CODEC
+static struct avdtp_sep_ind btaptx_ind = {
+	.get_capability         = btaptx_getcap_ind,
+	.set_configuration      = btaptx_setconf_ind,
+	.get_configuration      = getconf_ind,
+	.open                   = open_ind,
+	.start                  = start_ind,
+	.suspend                = suspend_ind,
+	.close                  = close_ind,
+	.abort                  = abort_ind,
+	.reconfigure            = reconf_ind,
+        .delayreport            = delayreport_ind,
+};
+
+#endif //ENABLE_CSR_APTX_CODEC
+
+
 static sdp_record_t *a2dp_record(uint8_t type, uint16_t avdtp_ver)
 {
 	sdp_list_t *svclass_id, *pfseq, *apseq, *root;
@@ -1398,7 +1626,10 @@ int a2dp_register(DBusConnection *conn, const bdaddr_t *src, GKeyFile *config)
 	int sbc_srcs = 1, sbc_sinks = 1;
 	int mpeg12_srcs = 0, mpeg12_sinks = 0;
 	gboolean source = TRUE, sink = FALSE, socket = TRUE;
-	gboolean delay_reporting = FALSE;
+	gboolean delay_reporting = FALSE, sbc_quality = TRUE;
+#ifdef ENABLE_CSR_APTX_CODEC
+	int btaptx_srcs = 1, btaptx_sinks = 1;
+#endif //ENABLE_CSR_APTX_CODEC
 	char *str;
 	GError *err = NULL;
 	int i;
@@ -1441,6 +1672,10 @@ int a2dp_register(DBusConnection *conn, const bdaddr_t *src, GKeyFile *config)
 		sbc_sinks = 0;
 		mpeg12_srcs = 0;
 		mpeg12_sinks = 0;
+#ifdef ENABLE_CSR_APTX_CODEC
+		btaptx_srcs = 0;
+		btaptx_sinks = 0;
+#endif
 		goto proceed;
 	}
 
@@ -1462,6 +1697,17 @@ int a2dp_register(DBusConnection *conn, const bdaddr_t *src, GKeyFile *config)
 		g_free(str);
 	}
 
+#ifdef ENABLE_CSR_APTX_CODEC
+	str = g_key_file_get_string(config, "A2DP", "APTXSources", &err);
+	if (err) {
+		DBG("audio.conf: %s", err->message);
+		g_clear_error(&err);
+	} else {
+		btaptx_srcs = atoi(str);
+		g_free(str);
+	}
+#endif
+
 	str = g_key_file_get_string(config, "A2DP", "SBCSinks", &err);
 	if (err) {
 		DBG("audio.conf: %s", err->message);
@@ -1477,6 +1723,30 @@ int a2dp_register(DBusConnection *conn, const bdaddr_t *src, GKeyFile *config)
 		g_clear_error(&err);
 	} else {
 		mpeg12_sinks = atoi(str);
+		g_free(str);
+	}
+
+#ifdef ENABLE_CSR_APTX_CODEC
+	str = g_key_file_get_string(config, "A2DP", "APTXSinks", &err);
+	if (err) {
+		DBG("audio.conf: %s", err->message);
+		g_clear_error(&err);
+	} else {
+		btaptx_sinks = atoi(str);
+		g_free(str);
+	}
+#endif
+
+	str = g_key_file_get_string(config, "A2DP", "SBCQuality", &err);
+	if (err) {
+		DBG("audio.conf: %s", err->message);
+		g_clear_error(&err);
+	} else {
+		if (g_strcmp0(str, "MEDIUM") == 0) {
+			DBG("explict medium setting used");
+			sbc_quality = FALSE;
+		}
+
 		g_free(str);
 	}
 
@@ -1521,6 +1791,12 @@ proceed:
 			a2dp_add_sep(src, AVDTP_SEP_TYPE_SOURCE,
 					A2DP_CODEC_MPEG12, delay_reporting,
 					NULL, NULL);
+#ifdef ENABLE_CSR_APTX_CODEC
+		for (i = 0; i < btaptx_srcs; i++)
+			a2dp_add_sep(src, AVDTP_SEP_TYPE_SOURCE,
+					NON_A2DP_CODEC_BTAPTX, delay_reporting,
+					NULL, NULL);
+#endif
 	}
 	server->sink_enabled = sink;
 	if (sink) {
@@ -1532,7 +1808,16 @@ proceed:
 			a2dp_add_sep(src, AVDTP_SEP_TYPE_SINK,
 					A2DP_CODEC_MPEG12, delay_reporting,
 					NULL, NULL);
+#ifdef ENABLE_CSR_APTX_CODEC
+		for (i = 0; i < btaptx_sinks; i++)
+			a2dp_add_sep(src, AVDTP_SEP_TYPE_SINK,
+					NON_A2DP_CODEC_BTAPTX, delay_reporting,
+					NULL, NULL);
+#endif
+
 	}
+	server->sbc_quality_high = sbc_quality;
+
 
 	return 0;
 }
@@ -1606,13 +1891,17 @@ struct a2dp_sep *a2dp_add_sep(const bdaddr_t *src, uint8_t type,
 
 	sep = g_new0(struct a2dp_sep, 1);
 
-	if (endpoint) {
-		ind = &endpoint_ind;
-		goto proceed;
+	if (codec == A2DP_CODEC_SBC) {
+		ind = &sbc_ind;
+	} else
+#ifdef ENABLE_CSR_APTX_CODEC
+	if (codec == NON_A2DP_CODEC_BTAPTX) {
+		ind = &btaptx_ind;
+	} else
+#endif //ENABLE_CSR_APTX_CODEC
+	{
+		error("Unknow codec from a2dp_add_sep() codec=%u \n", codec);
 	}
-
-	ind = (codec == A2DP_CODEC_MPEG12) ? &mpeg_ind : &sbc_ind;
-
 proceed:
 	sep->lsep = avdtp_register_sep(&server->src, type,
 					AVDTP_MEDIA_TYPE_AUDIO, codec,
@@ -1629,6 +1918,7 @@ proceed:
 	sep->codec = codec;
 	sep->type = type;
 	sep->delay_reporting = delay_reporting;
+	sep->remote_suspend = FALSE;
 
 	if (type == AVDTP_SEP_TYPE_SOURCE) {
 		l = &server->sources;
@@ -1736,7 +2026,7 @@ struct a2dp_sep *a2dp_get(struct avdtp *session,
 	return NULL;
 }
 
-static uint8_t default_bitpool(uint8_t freq, uint8_t mode)
+static uint8_t high_quality_default_bitpool(uint8_t freq, uint8_t mode)
 {
 	switch (freq) {
 	case SBC_SAMPLING_FREQ_16000:
@@ -1772,10 +2062,106 @@ static uint8_t default_bitpool(uint8_t freq, uint8_t mode)
 	}
 }
 
-static gboolean select_sbc_params(struct sbc_codec_cap *cap,
-					struct sbc_codec_cap *supported)
+static uint8_t medium_quality_default_bitpool(uint8_t freq, uint8_t mode)
 {
-	unsigned int max_bitpool, min_bitpool;
+	switch (freq) {
+	case SBC_SAMPLING_FREQ_16000:
+	case SBC_SAMPLING_FREQ_32000:
+		return 35;
+	case SBC_SAMPLING_FREQ_44100:
+		switch (mode) {
+		case SBC_CHANNEL_MODE_MONO:
+		case SBC_CHANNEL_MODE_DUAL_CHANNEL:
+			return 19;
+		case SBC_CHANNEL_MODE_STEREO:
+		case SBC_CHANNEL_MODE_JOINT_STEREO:
+			return 35;
+		default:
+			error("Invalid channel mode %u", mode);
+			return 35;
+		}
+	case SBC_SAMPLING_FREQ_48000:
+		switch (mode) {
+		case SBC_CHANNEL_MODE_MONO:
+		case SBC_CHANNEL_MODE_DUAL_CHANNEL:
+			return 18;
+		case SBC_CHANNEL_MODE_STEREO:
+		case SBC_CHANNEL_MODE_JOINT_STEREO:
+			return 33;
+		default:
+			error("Invalid channel mode %u", mode);
+			return 33;
+		}
+	default:
+		error("Invalid sampling freq %u", freq);
+		return 35;
+	}
+}
+
+#ifdef ENABLE_CSR_APTX_CODEC
+
+static gboolean select_btaptx_params(struct btaptx_codec_cap *cap,
+				struct btaptx_codec_cap *supported) {
+
+	memset(cap, 0, sizeof(struct btaptx_codec_cap));
+
+	cap->cap.media_type = AVDTP_MEDIA_TYPE_AUDIO;
+	cap->cap.media_codec_type = NON_A2DP_CODEC_BTAPTX;
+
+	if (supported->frequency & BTAPTX_SAMPLING_FREQ_44100)
+		cap->frequency = BTAPTX_SAMPLING_FREQ_44100;
+	else if (supported->frequency & BTAPTX_SAMPLING_FREQ_48000)
+		cap->frequency = BTAPTX_SAMPLING_FREQ_48000;
+	else if (supported->frequency & BTAPTX_SAMPLING_FREQ_32000)
+		cap->frequency = BTAPTX_SAMPLING_FREQ_32000;
+	else if (supported->frequency & BTAPTX_SAMPLING_FREQ_16000)
+		cap->frequency = BTAPTX_SAMPLING_FREQ_16000;
+	else {
+		error("No aptX supported frequencies");
+		return FALSE;
+	}
+
+	if (supported->channel_mode & BTAPTX_CHANNEL_MODE_JOINT_STEREO)
+		cap->channel_mode = BTAPTX_CHANNEL_MODE_STEREO;
+	else if (supported->channel_mode & BTAPTX_CHANNEL_MODE_STEREO)
+		cap->channel_mode = BTAPTX_CHANNEL_MODE_STEREO;
+	else if (supported->channel_mode & BTAPTX_CHANNEL_MODE_DUAL_CHANNEL)
+		cap->channel_mode = BTAPTX_CHANNEL_MODE_STEREO;
+	else {
+		error("No aptX supported channel modes");
+		return FALSE;
+	}
+	if (cap->cap.media_codec_type == NON_A2DP_CODEC_BTAPTX) {
+		if((supported->vender_id0 == BTAPTX_VENDER_ID0)
+			&& (supported->vender_id1 == BTAPTX_VENDER_ID1)
+			&& (supported->vender_id2 == BTAPTX_VENDER_ID2)
+			&& (supported->vender_id3 == BTAPTX_VENDER_ID3)
+			&& (supported->codec_id0 == BTAPTX_CODEC_ID0)
+			&& (supported->codec_id1 == BTAPTX_CODEC_ID1) )
+		{
+				//DBG("Updating aptX venderIds and CodecIds");
+			cap->vender_id0 = BTAPTX_VENDER_ID0;
+			cap->vender_id1 = BTAPTX_VENDER_ID1;
+			cap->vender_id2 = BTAPTX_VENDER_ID2;
+			cap->vender_id3 = BTAPTX_VENDER_ID3;
+			cap->codec_id0 = BTAPTX_CODEC_ID0;
+			cap->codec_id1 = BTAPTX_CODEC_ID1;
+			return TRUE;
+		}
+		else {
+			DBG("aptX not found");
+			return FALSE;
+		}
+	 }
+	return FALSE;
+}
+#endif //ENABLE_CSR_APTX_CODEC
+
+static gboolean select_sbc_params(struct sbc_codec_cap *cap,
+					struct sbc_codec_cap *supported,
+					gboolean edr_capability)
+{
+	unsigned int max_bitpool, min_bitpool, def_bitpool;
 
 	memset(cap, 0, sizeof(struct sbc_codec_cap));
 
@@ -1836,8 +2222,14 @@ static gboolean select_sbc_params(struct sbc_codec_cap *cap,
 		cap->allocation_method = SBC_ALLOCATION_SNR;
 
 	min_bitpool = MAX(MIN_BITPOOL, supported->min_bitpool);
-	max_bitpool = MIN(default_bitpool(cap->frequency, cap->channel_mode),
-							supported->max_bitpool);
+
+	def_bitpool = (edr_capability) ?
+				high_quality_default_bitpool(cap->frequency,
+								cap->channel_mode) :
+				medium_quality_default_bitpool(cap->frequency,
+								cap->channel_mode);
+
+	max_bitpool = MIN(def_bitpool, supported->max_bitpool);
 
 	cap->min_bitpool = min_bitpool;
 	cap->max_bitpool = max_bitpool;
@@ -1851,20 +2243,51 @@ static gboolean select_capabilities(struct avdtp *session,
 {
 	struct avdtp_service_capability *media_transport, *media_codec;
 	struct sbc_codec_cap sbc_cap;
+	bdaddr_t src, dst;
+	gboolean edr_capability;
+
+#ifdef ENABLE_CSR_APTX_CODEC
+	struct btaptx_codec_cap btaptx_cap;
+	gboolean btaptx_found=FALSE;
+#endif //ENABLE_CSR_APTX_CODEC
 
 	media_codec = avdtp_get_codec(rsep);
 	if (!media_codec)
 		return FALSE;
 
-	select_sbc_params(&sbc_cap, (struct sbc_codec_cap *) media_codec->data);
+	avdtp_get_peers(session, &src, &dst);
+	edr_capability = a2dp_read_edrcapability(&src, &dst);
+
+#ifdef ENABLE_CSR_APTX_CODEC
+	btaptx_found = select_btaptx_params(&btaptx_cap,
+					(struct btaptx_codec_cap *) media_codec->data);
+
+	if (btaptx_found == FALSE)
+#endif //ENABLE_CSR_APTX_CODEC
+        {
+		select_sbc_params(&sbc_cap, (struct sbc_codec_cap *) media_codec->data,
+						edr_capability);
+	}
 
 	media_transport = avdtp_service_cap_new(AVDTP_MEDIA_TRANSPORT,
 						NULL, 0);
 
 	*caps = g_slist_append(*caps, media_transport);
 
-	media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, &sbc_cap,
-						sizeof(sbc_cap));
+#ifdef ENABLE_CSR_APTX_CODEC
+	if(btaptx_found==TRUE)
+	{
+		DBG("aptX set..");
+		media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, &btaptx_cap,
+							sizeof(btaptx_cap));
+	}
+	else
+#endif //ENABLE_CSR_APTX_CODEC
+	{
+		DBG("SBC set..");
+		media_codec = avdtp_service_cap_new(AVDTP_MEDIA_CODEC, &sbc_cap,
+							sizeof(sbc_cap));
+	}
 
 	*caps = g_slist_append(*caps, media_codec);
 
@@ -1919,6 +2342,69 @@ static gboolean auto_select(gpointer data)
 	return FALSE;
 }
 
+#ifdef ENABLE_CSR_APTX_CODEC
+static struct a2dp_sep *a2dp_find_sep(struct avdtp *session, GSList *list,
+					const char *sender)
+{
+	int non_a2dp_found=0;
+	GSList *list2 = list;
+
+	for (; list; list = list->next) {
+		struct a2dp_sep *sep = list->data;
+
+		if (sep->codec!= NON_A2DP_CODEC_BTAPTX)
+			continue;
+
+		if (sep->codec== NON_A2DP_CODEC_BTAPTX){
+			/* Use sender's endpoint if available */
+			if (sender) {
+				const char *name;
+
+				if (sep->endpoint == NULL)
+					continue;
+
+				name = media_endpoint_get_sender(sep->endpoint);
+				if (g_strcmp0(sender, name) != 0)
+					continue;
+			}
+
+			if (avdtp_find_remote_sep(session, sep->lsep) == NULL)
+				continue;
+
+			non_a2dp_found=1;
+			return sep;
+		}
+
+	}
+
+	if (non_a2dp_found == 0) {
+		for (; list2; list2 = list2->next) {
+			struct a2dp_sep *sep = list2->data;
+
+			if (sep->codec!= A2DP_CODEC_SBC)
+				continue;
+
+			/* Use sender's endpoint if available */
+			if (sender) {
+				const char *name;
+
+				if (sep->endpoint == NULL)
+					continue;
+
+				name = media_endpoint_get_sender(sep->endpoint);
+				if (g_strcmp0(sender, name) != 0)
+					continue;
+			}
+
+			if (avdtp_find_remote_sep(session, sep->lsep) == NULL)
+				continue;
+
+			return sep;
+		}
+	}
+	return NULL;
+}
+#else
 static struct a2dp_sep *a2dp_find_sep(struct avdtp *session, GSList *list,
 					const char *sender)
 {
@@ -1945,6 +2431,7 @@ static struct a2dp_sep *a2dp_find_sep(struct avdtp *session, GSList *list,
 
 	return NULL;
 }
+#endif // ENABLE_CSR_APTX_CODEC
 
 static struct a2dp_sep *a2dp_select_sep(struct avdtp *session, uint8_t type,
 					const char *sender)
@@ -2031,6 +2518,166 @@ fail:
 
 }
 
+#ifdef ENABLE_CSR_APTX_CODEC
+
+unsigned int a2dp_config(struct avdtp *session, struct a2dp_sep *sep,
+				a2dp_config_cb_t cb, GSList *caps,
+				void *user_data)
+{
+	struct a2dp_setup_cb *cb_data;
+	GSList *l;
+	struct a2dp_server *server;
+	struct a2dp_setup *setup;
+	struct a2dp_sep *tmp;
+	struct avdtp_service_capability *cap;
+	struct avdtp_media_codec_capability *codec_cap = NULL;
+	int posix_err;
+	bdaddr_t src;
+
+	//aptx extra
+	int btaptx_found=0;
+
+	avdtp_get_peers(session, &src, NULL);
+	server = find_server(servers, &src);
+	if (!server)
+	return 0;
+
+	for (l = caps; l != NULL; l = l->next) {
+		cap = l->data;
+
+		if (cap->category != AVDTP_MEDIA_CODEC)
+			continue;
+
+		codec_cap = (void *) cap->data;
+
+		if(codec_cap->media_codec_type!=NON_A2DP_CODEC_BTAPTX)
+			continue;
+
+		DBG("codec_cap->media_codec_type=%d", codec_cap->media_codec_type);
+
+		if (codec_cap->media_codec_type == NON_A2DP_CODEC_BTAPTX) {
+			DBG("Non-A2DP: codec_cap->media_codec_type=%d", codec_cap->media_codec_type);
+			struct btaptx_codec_cap *btaptx_cap = (void *) codec_cap;
+
+			if((btaptx_cap->vender_id0 == BTAPTX_VENDER_ID0)
+				&& (btaptx_cap->vender_id1 == BTAPTX_VENDER_ID1)
+				&& (btaptx_cap->vender_id2 == BTAPTX_VENDER_ID2)
+				&& (btaptx_cap->vender_id3 == BTAPTX_VENDER_ID3)
+				&& (btaptx_cap->codec_id0 == BTAPTX_CODEC_ID0)
+				&& (btaptx_cap->codec_id1 == BTAPTX_CODEC_ID1)) {
+
+					DBG("Non-A2DP aptX codec found..\n");
+					btaptx_found=1;
+					codec_cap = (void *) cap->data;
+					goto btaptx_proceed;
+			}
+		}
+	}
+
+	if (btaptx_found == 0) {
+		codec_cap=NULL;
+		for (l = caps; l != NULL; l = l->next) {
+			cap = l->data;
+
+			if (cap->category != AVDTP_MEDIA_CODEC)
+				continue;
+
+			codec_cap = (void *) cap->data;
+			break;
+		}
+	}
+
+btaptx_proceed:
+
+	if (!codec_cap)
+		return 0;
+
+	if (sep->codec != codec_cap->media_codec_type)
+		return 0;
+
+	DBG("a2dp_config : selected SEP %p", sep->lsep);
+
+	setup = a2dp_setup_get(session);
+	if (!setup)
+		return 0;
+
+	cb_data = setup_cb_new(setup);
+	cb_data->config_cb = cb;
+	cb_data->user_data = user_data;
+
+	setup->sep = sep;
+	setup->stream = sep->stream;
+
+	/* Copy given caps if they are different than current caps */
+	if (setup->caps != caps) {
+		g_slist_foreach(setup->caps, (GFunc) g_free, NULL);
+		g_slist_free(setup->caps);
+		g_slist_foreach(caps, copy_capabilities, &setup->caps);
+	}
+
+	switch (avdtp_sep_get_state(sep->lsep)) {
+	case AVDTP_STATE_IDLE:
+		if (sep->type == AVDTP_SEP_TYPE_SOURCE)
+			l = server->sources;
+		else
+			l = server->sinks;
+
+		for (; l != NULL; l = l->next) {
+			tmp = l->data;
+			if (avdtp_has_stream(session, tmp->stream))
+				break;
+		}
+
+		if (l != NULL) {
+			if (a2dp_sep_get_lock(tmp))
+				goto failed;
+			setup->reconfigure = TRUE;
+			if (avdtp_close(session, tmp->stream, FALSE) < 0) {
+				error("avdtp_close failed");
+				goto failed;
+			}
+			break;
+		}
+
+		setup->rsep = avdtp_find_remote_sep(session, sep->lsep);
+		if (setup->rsep == NULL) {
+			error("No matching ACP and INT SEPs found");
+			goto failed;
+		}
+
+		posix_err = avdtp_set_configuration(session, setup->rsep, sep->lsep,
+				caps, &setup->stream);
+		if (posix_err < 0) {
+			error("avdtp_set_configuration: %s", strerror(-posix_err));
+			goto failed;
+		}
+		break;
+	case AVDTP_STATE_OPEN:
+	case AVDTP_STATE_STREAMING:
+		if (avdtp_stream_has_capabilities(setup->stream, caps)) {
+			DBG("Configuration match: resuming");
+			cb_data->source_id = g_idle_add(finalize_config, setup);
+		} else if (!setup->reconfigure) {
+			setup->reconfigure = TRUE;
+			if (avdtp_close(session, sep->stream, FALSE) < 0) {
+				error("avdtp_close failed");
+				goto failed;
+			}
+		}
+		break;
+		default:
+		error("SEP in bad state for requesting a new stream");
+		goto failed;
+	}
+
+	return cb_data->id;
+
+failed: setup_cb_free(cb_data);
+	return 0;
+}
+
+#else
+
 unsigned int a2dp_config(struct avdtp *session, struct a2dp_sep *sep,
 				a2dp_config_cb_t cb, GSList *caps,
 				void *user_data)
@@ -2083,7 +2730,7 @@ unsigned int a2dp_config(struct avdtp *session, struct a2dp_sep *sep,
 	if (setup->caps != caps) {
 		g_slist_foreach(setup->caps, (GFunc) g_free, NULL);
 		g_slist_free(setup->caps);
-		setup->caps = g_slist_copy(caps);
+		g_slist_foreach(caps, copy_capabilities, &setup->caps);
 	}
 
 	switch (avdtp_sep_get_state(sep->lsep)) {
@@ -2150,6 +2797,7 @@ failed:
 	setup_cb_free(cb_data);
 	return 0;
 }
+#endif //ENABLE_CSR_APTX_CODEC
 
 unsigned int a2dp_resume(struct avdtp *session, struct a2dp_sep *sep,
 				a2dp_stream_cb_t cb, void *user_data)
@@ -2295,7 +2943,6 @@ gboolean a2dp_sep_unlock(struct a2dp_sep *sep, struct avdtp *session)
 	avdtp_state_t state;
 	GSList *l;
 
-	state = avdtp_sep_get_state(sep->lsep);
 
 	sep->locked = FALSE;
 
@@ -2306,11 +2953,19 @@ gboolean a2dp_sep_unlock(struct a2dp_sep *sep, struct avdtp *session)
 	else
 		l = server->sinks;
 
+	if (l == NULL) {
+		return TRUE;
+	}
 	/* Unregister sep if it was removed */
 	if (g_slist_find(l, sep) == NULL) {
 		a2dp_unregister_sep(sep);
 		return TRUE;
 	}
+
+	if (sep->lsep == NULL) {
+		return TRUE;
+	}
+	state = avdtp_sep_get_state(sep->lsep);
 
 	if (!sep->stream || state == AVDTP_STATE_IDLE)
 		return TRUE;
@@ -2320,7 +2975,7 @@ gboolean a2dp_sep_unlock(struct a2dp_sep *sep, struct avdtp *session)
 		/* Set timer here */
 		break;
 	case AVDTP_STATE_STREAMING:
-		if (avdtp_suspend(session, sep->stream) == 0)
+		if (session && avdtp_suspend(session, sep->stream) == 0)
 			sep->suspending = TRUE;
 		break;
 	default:
@@ -2376,4 +3031,54 @@ struct a2dp_sep *a2dp_get_sep(struct avdtp *session,
 struct avdtp_stream *a2dp_sep_get_stream(struct a2dp_sep *sep)
 {
 	return sep->stream;
+}
+
+gboolean a2dp_is_reconfig(struct avdtp *session)
+{
+	struct a2dp_setup *setup;
+	gboolean is_reconfig;
+
+	DBG("a2dp_is_reconfig");
+	if (!session)
+		return FALSE;
+	setup = a2dp_setup_get(session);
+	if (!setup)
+		return FALSE;
+	is_reconfig = setup->reconfigure;
+	setup_unref(setup);
+	return is_reconfig ;
+}
+
+gboolean a2dp_read_edrcapability(bdaddr_t *src, bdaddr_t *dst)
+{
+	uint16_t version;
+	uint8_t remote_features[8];
+	struct a2dp_server *server;
+
+	if (!src || !dst)
+		return FALSE;
+
+	server = find_server(servers, src);
+
+	if (!server || (FALSE == server->sbc_quality_high)) {
+		return FALSE;
+	}
+
+	read_version_info(src, dst, &version);
+
+	DBG("remote device version is %d", version);
+	if (version < 3)
+		return FALSE;
+	else {
+		read_remote_features(src, dst, &remote_features[0], NULL);
+		// If any ACL EDR bit is set, remote device supports EDR rates over A2DP
+		if ((remote_features[EDR_ACL_2_MBPS_BYTE] & EDR_ACL_2_MBPS_MASK) ||
+			(remote_features[EDR_ACL_3_MBPS_BYTE] & EDR_ACL_3_MBPS_MASK) ||
+			(remote_features[_3_SLOT_EDR_ACL_BYTE] & _3_SLOT_EDR_ACL_MASK) ||
+			(remote_features[_5_SLOT_EDR_ACL_BYTE] & _5_SLOT_EDR_ACL_MASK) ) {
+			return TRUE;
+		} else
+			return FALSE;
+	}
+	return FALSE;
 }

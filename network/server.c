@@ -3,7 +3,7 @@
  *  BlueZ - Bluetooth protocol stack for Linux
  *
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
- *
+ *  Copyright (C) 2012, Code Aurora Forum. All rights reserved.
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -53,13 +53,45 @@
 
 #define NETWORK_SERVER_INTERFACE "org.bluez.NetworkServer"
 #define SETUP_TIMEOUT		1
+#define BNEP_EXT_CONTROL 0
+
+typedef struct _svc_uuid {
+	uint64_t h; /* 64-bit higher uuid part */
+	uint64_t l; /* 64-bit lower uuid part */
+}svc_uuid;
+
+#define PANU_SVC_UUID_H    0x0000111500001000
+#define PANU_SVC_UUID_L    0x800000805F9B34FB
+#define NAP_SVC_UUID_H     0x0000111600001000
+#define NAP_SVC_UUID_L     0x800000805F9B34FB
+#define GN_SVC_UUID_H      0x0000111700001000
+#define GN_SVC_UUID_L      0x800000805F9B34FB
+
+
+svc_uuid bnep_svc_uuid[] = {
+	{
+		/* PANU 128-bit UUID */
+		.h = PANU_SVC_UUID_H,
+		.l = PANU_SVC_UUID_L,
+	},
+	{
+		/* NAP 128-bit UUID */
+		.h = NAP_SVC_UUID_H,
+		.l = NAP_SVC_UUID_L,
+	},
+	{
+		/* GN 128-bit UUID */
+		.h = GN_SVC_UUID_H,
+		.l = GN_SVC_UUID_L,
+	}
+};
 
 /* Pending Authorization */
 struct network_session {
 	bdaddr_t	dst;		/* Remote Bluetooth Address */
 	GIOChannel	*io;		/* Pending connect channel */
 	guint		watch;		/* BNEP socket watch */
-        guint           io_watch;
+	guint		io_watch;
 };
 
 struct network_adapter {
@@ -85,6 +117,7 @@ struct network_server {
 static DBusConnection *connection = NULL;
 static GSList *adapters = NULL;
 static gboolean security = TRUE;
+static gboolean master = FALSE;
 
 static struct network_adapter *find_adapter(GSList *list,
 					struct btd_adapter *adapter)
@@ -292,6 +325,17 @@ static ssize_t send_bnep_ctrl_rsp(int sk, uint16_t val)
 	return send(sk, &rsp, sizeof(rsp), 0);
 }
 
+static ssize_t send_bnep_ext_ctrl_rsp(int sk, int ctrl, uint16_t val)
+{
+	struct bnep_control_rsp rsp;
+
+	rsp.type = BNEP_CONTROL;
+	rsp.ctrl = ctrl;
+	rsp.resp = htons(val);
+
+	return send(sk, &rsp, sizeof(rsp), 0);
+}
+
 static void session_free(void *data)
 {
 	struct network_session *session = data;
@@ -325,6 +369,8 @@ static void bnep_watchdog_cb(GIOChannel *chan, GIOCondition cond,
 				ns->iface, "DeviceDisconnected",
 				DBUS_TYPE_STRING, &paddr,
 				DBUS_TYPE_INVALID);
+
+	ns->sessions = g_slist_remove(ns->sessions, session);
 	g_io_channel_shutdown(chan, TRUE, NULL);
 	g_io_channel_unref(session->io);
 	session->io = NULL;
@@ -399,10 +445,21 @@ static uint16_t bnep_setup_chk(uint16_t dst_role, uint16_t src_role)
 	return BNEP_CONN_INVALID_DST;
 }
 
+static inline uint64_t get_u64(uint64_t *src)
+{
+	uint64_t u64 = bt_get_unaligned(src), temp;
+	temp = ntohl(u64 & 0xFFFFFFFF);
+	u64 = (temp << 32) | ntohl(u64 >> 32);
+	return u64;
+}
+
 static uint16_t bnep_setup_decode(struct bnep_setup_conn_req *req,
 				uint16_t *dst_role, uint16_t *src_role)
 {
 	uint8_t *dest, *source;
+	uint64_t uuid_l, uuid_h;
+	uint8_t svc_cnt;
+	int i;
 
 	dest = req->service;
 	source = req->service + req->uuid_size;
@@ -413,9 +470,51 @@ static uint16_t bnep_setup_decode(struct bnep_setup_conn_req *req,
 		*src_role = ntohs(bt_get_unaligned((uint16_t *) source));
 		break;
 	case 4: /* UUID32 */
+		/* Pre-validate 32-bit UUID */
+		uuid_l = ntohl(bt_get_unaligned((uint32_t *) dest));
+		if (uuid_l != BNEP_SVC_NAP && uuid_l != BNEP_SVC_GN &&
+				uuid_l != BNEP_SVC_PANU)
+			return BNEP_CONN_INVALID_DST;
+		*dst_role = (uint16_t)uuid_l;
+		uuid_l = ntohl(bt_get_unaligned((uint32_t *) source));
+		if (uuid_l != BNEP_SVC_NAP && uuid_l != BNEP_SVC_GN &&
+				uuid_l != BNEP_SVC_PANU)
+			return BNEP_CONN_INVALID_SRC;
+		*src_role = (uint16_t)uuid_l;
+		break;
 	case 16: /* UUID128 */
-		*dst_role = ntohl(bt_get_unaligned((uint32_t *) dest));
-		*src_role = ntohl(bt_get_unaligned((uint32_t *) source));
+		/* Pre-validate 128-bit UUID */
+		svc_cnt = sizeof(bnep_svc_uuid)/sizeof(bnep_svc_uuid[0]);
+		uuid_h = get_u64((uint64_t *) dest);
+		uuid_l = get_u64((uint64_t *) (dest + 8));
+		for (i = 0; i < svc_cnt; i++) {
+			if (uuid_h == bnep_svc_uuid[i].h &&
+					uuid_l == bnep_svc_uuid[i].l) {
+				/* Consider only 16-bit equivalent UUID
+                                 * for further operations
+				 */
+				*dst_role = (uint16_t)((uuid_h >> 32)
+							& 0xFFFFFFFF);
+				break;
+			}
+		}
+		if (i == svc_cnt)
+			return BNEP_CONN_INVALID_DST;
+		uuid_h = get_u64((uint64_t *) source);
+		uuid_l = get_u64((uint64_t *) (source + 8));
+		for (i = 0; i < svc_cnt; i++) {
+			if (uuid_h == bnep_svc_uuid[i].h &&
+					uuid_l == bnep_svc_uuid[i].l) {
+				/* Consider only 16-bit equivalent UUID
+                                 * for further operations
+				 */
+				*src_role = (uint16_t)((uuid_h >> 32)
+							& 0xFFFFFFFF);
+				break;
+			}
+		}
+		if (i == svc_cnt)
+			return BNEP_CONN_INVALID_SRC;
 		break;
 	default:
 		return BNEP_CONN_INVALID_SVC;
@@ -437,6 +536,36 @@ static void setup_destroy(void *user_data)
 	session_free(setup);
 }
 
+static void parse_extension_data(int sk, void *ext)
+{
+	struct bnep_ext_hdr *h;
+	int ext_ctrl_type =0;
+	do {
+		h = (void *) ext;
+		if(h == NULL)
+			break;
+		DBG("type 0x%x len %d", h->type, h->len);
+
+		switch (h->type & BNEP_TYPE_MASK) {
+		case BNEP_EXT_CONTROL:
+			ext_ctrl_type = h->data[0];
+			DBG("ctrl type is %d", ext_ctrl_type);
+			if(ext_ctrl_type == BNEP_FILTER_NET_TYPE_SET) {
+			    send_bnep_ext_ctrl_rsp(sk, BNEP_FILTER_NET_TYPE_RSP,
+							BNEP_FILTER_UNSUPPORTED_REQ);
+			} else if(ext_ctrl_type == BNEP_FILTER_MULT_ADDR_SET) {
+			    send_bnep_ext_ctrl_rsp(sk, BNEP_FILTER_MULT_ADDR_RSP,
+							BNEP_FILTER_UNSUPPORTED_REQ);
+			}
+			break;
+		default:
+			/* Unknown extension, skip it. */
+			break;
+		}
+		ext = h->data + h->len;
+	} while (h->type & BNEP_EXT_HEADER);
+ }
+
 static gboolean bnep_setup(GIOChannel *chan,
 			GIOCondition cond, gpointer user_data)
 {
@@ -446,7 +575,9 @@ static gboolean bnep_setup(GIOChannel *chan,
 	struct bnep_setup_conn_req *req = (void *) packet;
 	uint16_t src_role, dst_role, rsp = BNEP_CONN_NOT_ALLOWED;
 	int n, sk;
+	void *ext = NULL;
 
+	DBG("enter bnep_setup");
 	if (cond & G_IO_NVAL)
 		return FALSE;
 
@@ -479,8 +610,10 @@ static gboolean bnep_setup(GIOChannel *chan,
 		return FALSE;
 	}
 
-	if (req->type != BNEP_CONTROL || req->ctrl != BNEP_SETUP_CONN_REQ)
+	if ((req->type & BNEP_TYPE_MASK) != BNEP_CONTROL || 
+			req->ctrl != BNEP_SETUP_CONN_REQ) {
 		return FALSE;
+	}
 
 	rsp = bnep_setup_decode(req, &dst_role, &src_role);
 	if (rsp)
@@ -489,6 +622,8 @@ static gboolean bnep_setup(GIOChannel *chan,
 	rsp = bnep_setup_chk(dst_role, src_role);
 	if (rsp)
 		goto reply;
+
+	rsp = BNEP_CONN_NOT_ALLOWED; // reset rsp to err value.
 
 	ns = find_server(na->servers, dst_role);
 	if (!ns) {
@@ -515,7 +650,11 @@ static gboolean bnep_setup(GIOChannel *chan,
 
 reply:
 	send_bnep_ctrl_rsp(sk, rsp);
-
+	if (req->type & BNEP_EXT_HEADER) {
+		// parse extension packets and send rsp as unsupported req (0x1).
+		ext = req->service + 4;// as size of data is 4 bytes
+		parse_extension_data(sk, ext);
+	}
 	return FALSE;
 }
 
@@ -616,9 +755,10 @@ drop:
 	g_io_channel_shutdown(chan, TRUE, NULL);
 }
 
-int server_init(DBusConnection *conn, gboolean secure)
+int server_init(DBusConnection *conn, gboolean secure, gboolean master_role)
 {
 	security = secure;
+	master = master_role;
 	connection = dbus_connection_ref(conn);
 
 	return 0;
@@ -834,6 +974,7 @@ static struct network_adapter *create_adapter(struct btd_adapter *adapter)
 
 	adapter_get_address(adapter, &src);
 
+	DBG("BNEP: master option for NAP device %d", master);
 	na->io = bt_io_listen(BT_IO_L2CAP, NULL, confirm_event, na,
 				NULL, &err,
 				BT_IO_OPT_SOURCE_BDADDR, &src,
@@ -842,6 +983,7 @@ static struct network_adapter *create_adapter(struct btd_adapter *adapter)
 				BT_IO_OPT_IMTU, BNEP_MTU,
 				BT_IO_OPT_SEC_LEVEL,
 				security ? BT_IO_SEC_MEDIUM : BT_IO_SEC_LOW,
+				BT_IO_OPT_MASTER, master,
 				BT_IO_OPT_INVALID);
 	if (!na->io) {
 		error("%s", err->message);
